@@ -1,0 +1,10 @@
+{
+  "name": "needwing",
+  "version": "1.0.0",
+  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Adds the remote Needwing MCP server (https://needwing.ai/mcp) and a research skill.",
+  "author": {
+    "name": "Needwing"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

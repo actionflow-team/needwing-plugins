@@ -1,0 +1,11 @@
+{
+  "name": "needwing",
+  "version": "1.0.0",
+  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Connects to the remote Needwing MCP endpoint at https://needwing.ai/mcp (OAuth sign-in on first use) and ships the Needwing research instructions as GEMINI.md.",
+  "mcpServers": {
+    "needwing": {
+      "httpUrl": "https://needwing.ai/mcp"
+    }
+  },
+  "contextFileName": "GEMINI.md"
+}

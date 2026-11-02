@@ -1,0 +1,24 @@
+{
+  "name": "needwing",
+  "description": "Needwing research tools for Claude Code: the remote Needwing MCP endpoint plus a research skill.",
+  "owner": {
+    "name": "Needwing",
+    "url": "https://needwing.ai"
+  },
+  "plugins": [
+    {
+      "name": "needwing",
+      "source": "./plugins/needwing",
+      "description": "Ask Needwing to research, compare and recommend, with grounded evidence. Connects to https://needwing.ai/mcp over Streamable HTTP (OAuth sign-in by default).",
+      "version": "1.0.0",
+      "author": {
+        "name": "Needwing",
+        "url": "https://needwing.ai"
+      },
+      "homepage": "https://needwing.ai/connect",
+      "repository": "https://github.com/actionflow-team/needwing-plugins",
+      "license": "MIT",
+      "keywords": ["needwing", "research", "search", "recommendations", "mcp"]
+    }
+  ]
+}

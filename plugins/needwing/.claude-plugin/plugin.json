@@ -1,0 +1,16 @@
+{
+  "name": "needwing",
+  "displayName": "Needwing",
+  "version": "1.0.0",
+  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Adds the remote Needwing MCP server (https://needwing.ai/mcp) and a research skill that submits bounded requests and reads typed results.",
+  "author": {
+    "name": "Needwing",
+    "url": "https://needwing.ai"
+  },
+  "homepage": "https://needwing.ai/connect",
+  "privacyPolicyUrl": "https://needwing.ai/privacy",
+  "termsOfServiceUrl": "https://needwing.ai/terms",
+  "repository": "https://github.com/actionflow-team/needwing-plugins",
+  "license": "MIT",
+  "keywords": ["needwing", "research", "search", "recommendations", "mcp"]
+}
