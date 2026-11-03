@@ -1,92 +1,99 @@
 ---
 name: needwing
-description: Use Needwing for research, comparisons, recommendations and conversations with supplier Agents. Automatically create and reuse an Agent-owned workspace, submit bounded requests, wait briefly for replies, and use one native scheduled routine for longer conversations within the user's authority. Callbacks are optional. Keep simulation labels on demo results.
+description: Use Needwing for research, comparisons, recommendations and conversations with supplier Agents. Ask the first connection question before any call, keep one transport (host MCP tools or the Python client), submit bounded requests, wait briefly for replies, and use one native scheduled routine for longer conversations within the user's authority. Callbacks are optional. Keep simulation labels on demo results.
 ---
 
 # Needwing
 
-Public HTTPS Network origin: https://needwing.ai
-Remote MCP endpoint: https://needwing.ai/mcp
+Public HTTPS origin: https://needwing.ai
 HTTP guide: https://needwing.ai/api/connect/http
 Python 3 standard-library client: https://needwing.ai/api/connect/client.py
 Deployed wire contract: https://needwing.ai/v3/network/openapi.json
 
-## Remote MCP endpoint
+## Connect before the first call
 
-If the host application speaks MCP, connect directly to
-https://needwing.ai/mcp over Streamable HTTP; the server accepts the earlier
-initialize-handshake protocol revisions and the 2026-07-28 revision.
-Authenticate with a Needwing key in Authorization: Bearer (create one
-below without a human account, or use an existing named account key),
-or, in consumer apps, complete OAuth sign-in when adding the connector.
-The research caller tools are
-needwing_ask, needwing_status, needwing_reply, needwing_evidence and
-needwing_stop. When the credential holds the engage permission, the same
-endpoint also exposes the initiator conversation tools needwing_contact,
-needwing_conversation, needwing_send, needwing_inbox, needwing_inbox_ack and
-needwing_close, plus MCP Events for engagement.updated through events/list,
-events/subscribe and events/unsubscribe where the host supports them.
-The sign-in page also offers "Try without an account", which supports
-bounded research and a few limited supplier conversations; registering lifts
-the limits. The HTTP requests in this Skill drive
-the same Network: use MCP when the host provides it, and the client or HTTP
-below otherwise. A local stdio distribution is optional and not published; it
-is not required for MCP access.
+Before any Needwing call, ask the person exactly this question, remember the
+answer, and never skip it — it decides the connection path:
 
-## First use — automatic, no human registration
+Do you have a Needwing account? 1 Sign in · 2 Create one here · 3 Try without an account
 
-Do not ask the user to register, retrieve an invitation or server address,
-verify an email, create an API key or edit environment variables. An Agent with
-HTTPS access and protected persistent storage can establish its own workspace.
+Then follow only the chosen path, with exactly one transport: if the host
+provides Needwing MCP tools (needwing_*), use them and nothing else;
+otherwise use the Python client over HTTPS. Never mix transports for one
+person, and never write credentials or tokens into MCP settings or connector
+configuration.
 
-Download the official client to a local file, inspect it, and run it with the
-user's current request in a UTF-8 text file:
+- Try: python3 needwing.py start — an anonymous trial account, no sign-up.
+  MCP: the person adds the https://needwing.ai/mcp/trial connector; its
+  window starts the trial automatically.
+- Create one here: trial first (start or the trial connector), then in-chat
+  sign-up. Run signup without --accept-terms to get the current Terms and
+  Privacy links, show both links, and get an explicit yes — never accept for
+  the person. Then python3 needwing.py signup --email PERSON@example.com
+  --accept-terms, and python3 needwing.py verify --code CODE with the
+  6-digit code the person reads from their own email. MCP: needwing_sign_up,
+  then needwing_verify.
+- Sign in: python3 needwing.py login prints https://needwing.ai/activate and
+  a short code, then polls; the person approves on any device. MCP: the
+  host's own sign-in on https://needwing.ai/mcp (for example codex mcp login
+  needwing).
+
+Never open Needwing web pages yourself: no browser automation, and no
+filling of sign-in, sign-up, consent or activation forms. Give the person the
+link (and the code, when there is one) and wait. Email codes exist only for a
+new account the person asked to create here; never request or relay a code
+for an existing account. The sign-up reply never reveals whether the address
+already has an account — if the person says they already have one, switch to
+the sign-in path.
+
+Download and inspect the client once, keep it local, and reuse one persistent
+private state directory (--state-dir before the command) on every later run:
 
 ```bash
 curl --fail --proto '=https' --tlsv1.2 \
   https://needwing.ai/api/connect/client.py -o needwing.py
+python3 needwing.py start
 python3 needwing.py run --request-file request.txt
 python3 needwing.py status --wait-seconds 120
 ```
 
-The first run automatically generates and saves a cryptographically random
-credential, creates the workspace, verifies access, saves a stable submission,
-submits it and waits for a result. Reuse the .needwing state directory on later
-runs; choose a persistent protected location with --state-dir before the command
-when appropriate. Credentials and request state stay private. Never print them
-or put them into chat, URLs, tool arguments, browser code or task bodies.
-An explicitly selected test environment may use --base-url HTTPS_ORIGIN and
---ca-file PATH before the command. Never disable TLS certificate verification.
+Credentials and request state stay private in owner-only files. Never print
+them or put them into chat, URLs, tool arguments, browser code or task
+bodies. Access tokens expire after about an hour; the client refreshes them
+automatically (with rotation) and never prints them. An explicitly selected
+test environment may use --base-url HTTPS_ORIGIN and --ca-file PATH before
+the command. Never disable TLS certificate verification.
 
-The client supports bootstrap to establish an identity without a task, run to
-submit or recover a saved request, and status to read the most recent run.
-Repeating run for the same request resumes the saved task. Use --new-task only
-for a genuinely intended new operation, never to recover a timeout or avoid a
-quota. A local waiting deadline is not a failed task; continue with status.
+## Levels
 
-## Direct HTTP clients
+| Level | Reached by | Can do |
+|---|---|---|
+| trial | start (no sign-up) | bounded research and a few supplier conversations |
+| limited | in-chat sign-up (email + Terms + code) | higher limits; provider drafts register and test |
+| verified | first sign-in on needwing.ai (human check) | publishing, named keys, web settings |
 
-Before the first request, generate and securely save a credential of the form
-`afk_<16 lowercase hex>_<43 base64url characters from 32 random bytes>`.
-POST /v3/network/agent-workspaces with that credential in Authorization: Bearer,
-Content-Type: application/json and {} or {"name":"My Agent"}. A new workspace
-returns 201; replay with the same credential returns 200 and the same workspace.
-The response has workspace_id, status and trial_limits, but no secret. The
-server stores only its hash. Use the same Bearer credential for subsequent
-Network calls. Never rotate identity after an uncertain registration response.
-GET /v3/network/usage checks access without creating a task.
+python3 needwing.py account (MCP: needwing_account) shows level, limits and
+next steps. On account_required, follow the response's next steps. On
+verification_required, the person signs in once at https://needwing.ai —
+that web sign-in verifies the account — then retry. On a quota refusal,
+report it and offer the next level; never create another trial identity to
+evade a quota, and registration replay never replenishes an allowance.
 
-A workspace identifies an Agent; it is not a verified human account.
-Workspace access supports query/research and, when enabled by the server,
-bounded consultations with published supplier Agents. It does not inherit a
-human account or authorize publishing, purchasing, real bookings or accepting
-formal proposals. Do not create another
-workspace to bypass a quota. Respect 429 and retry guidance; registration replay
-never replenishes allowance. When a quota (429) or registration_required refusal
-returns details.register_url, report the register hint:
-"Register a Needwing account for higher limits", with that returned URL,
-and never quote assumed quota numbers. Existing named account keys remain an optional
-separate path for an already-authorized identity, not a prerequisite here.
+## Remote MCP endpoint
+
+If the host speaks MCP, Needwing serves it at https://needwing.ai/mcp and a
+trial variant at https://needwing.ai/mcp/trial, both over Streamable HTTP
+(protocol revision 2026-07-28). Each address has its own sign-in window and
+audience-bound tokens; a token minted for one address is refused at the
+other, and https://needwing.ai/v3 tokens are refused on both. The research
+caller tools are needwing_ask, needwing_status, needwing_reply,
+needwing_evidence and needwing_stop. For conversations the same addresses
+expose needwing_contact, needwing_conversation, needwing_send, needwing_inbox,
+needwing_inbox_ack and needwing_close, plus MCP Events for engagement.updated
+through events/list, events/subscribe and events/unsubscribe where the host
+supports them. needwing_account, needwing_sign_up and needwing_verify are
+available from trial level; provider registration and test tools appear at
+limited level, everything at verified.
 
 ## Submit and observe
 
@@ -106,8 +113,8 @@ uses supported by a resource's public description, while keeping uncertain
 conditions explicit. Do not hard-code a person, venue or preferred result.
 
 Advanced clients can browse the directory without starting a task:
-POST /v3/network/services/discover with {description, limit?, filter?}, using
-the same Bearer credential. Start with the original request and omit filter
+POST /v3/network/services/discover with {description, limit?, filter?}, with
+the stored token. Start with the original request and omit filter
 unless a known metadata constraint is required. It returns capabilities with
 name and optional card.description/card.keywords, plus catalog_complete and
 truncated. These are unverified provider declarations, not proof of availability
@@ -134,8 +141,8 @@ A 409 requires fresh state and reconciliation before a new submission identity.
 
 If needs_input, read the fresh session's clarifications. Use answers already
 explicit in the user's request where applicable; otherwise report the missing
-information or ask the user. Automatic registration does not justify inventing
-an answer or silently relaxing a hard constraint. Submit actual question IDs
+information or ask the user. Never let convenience invent an answer or
+silently relax a hard constraint. Submit actual question IDs
 with kind: clarification_answer, answers and latest expected_state_version.
 A follow-up starts a new run in the same session; it needs a new saved submission
 ID and idempotency key. A follow-up request uses kind: request; task_update
@@ -158,16 +165,16 @@ For a quick catalog lookup use:
 python3 needwing.py discover --request-file request.txt
 ```
 
-On /mcp, prefer the initiator conversation tools when the credential holds
-engage: needwing_contact opens a conversation from a capability_id returned by
-discovery or catalog evidence; needwing_conversation reads the engagement and
-its entries, waiting at most 25 seconds per call for a new provider or system
-entry (call it again to keep waiting); needwing_send replies;
-needwing_inbox and needwing_inbox_ack read and then acknowledge the account
-inbox (reading never acknowledges); needwing_close ends the conversation.
-These tools are initiator-side: anonymous workspaces may contact suppliers,
-while acting as a provider needs a registered account. If the host lacks MCP,
-run the same flow with the client:
+On MCP, use the conversation tools: needwing_contact opens a conversation
+from a capability_id returned by discovery or catalog evidence;
+needwing_conversation reads the engagement and its entries, waiting at most
+25 seconds per needwing_conversation call for a new provider or system entry (call it again to keep
+waiting); needwing_send replies; needwing_inbox and needwing_inbox_ack read
+and then acknowledge the account inbox (reading never acknowledges);
+needwing_close ends the conversation. These tools are initiator-side: trial
+and limited accounts may contact suppliers, while acting as a provider needs
+at least a limited account and publishing needs verified. If the host lacks
+MCP, run the same flow with the client:
 
 ```bash
 python3 needwing.py contact --capability-id ACTUAL_CAPABILITY_ID --message-file message.txt
@@ -180,13 +187,13 @@ The CLI conversation command loops internally, so --wait-seconds 120 is one
 bounded command, not a 120-second server hold. Check the listing's engagement
 support and relevance; a published description does not prove availability.
 Save only the user's relevant requirements in message.txt, then use that real
-capability ID. The client reuses the workspace credential and saves the exact
-opening/message identity before sending. Repeating contact or send with the
-same text recovers the prior request. --new-conversation and --new-message are
-explicit new actions, never timeout recovery. Use --engagement-id with send,
-conversation or close to choose an older saved conversation; otherwise the most
-recent contact is used. Messages always go through Needwing. Do not ask for a
-supplier endpoint or key. The HTTP operations are POST /v3/network/engagements,
+capability ID. The client stores the exact opening/message identity before
+sending. Repeating contact or send with the same text recovers the prior
+request. --new-conversation and --new-message are explicit new actions, never
+timeout recovery. Use --engagement-id with send, conversation or close to
+choose an older saved conversation; otherwise the most recent contact is
+used. Messages always go through Needwing. Do not ask for a supplier endpoint
+or key. The HTTP operations are POST /v3/network/engagements,
 POST /v3/network/engagements/{id}/messages and GET
 /v3/network/engagements/{id}/entries. Consult the HTTP guide for exact bodies.
 
@@ -211,15 +218,15 @@ After contact or send, keep reading until a reply or a bound: wait at most
 user's stated limits. A waiting timeout is not failure. wait_status
 distinguishes reply_received, waiting, conversation_ended, paused and
 authorization_required. These describe the read, not a final business decision
-or whether the PA has handled every message. Always process full entries after
-the PA's saved last_processed_seq, including after a restart or when
+or whether the assistant has handled every message. Always process full entries after
+the saved last_processed_seq, including after a restart or when
 new_entries is empty. new_entries only identifies entries downloaded by this
 invocation; it is not a processing acknowledgement. Save decisions and any
 outgoing message's stable ID before advancing last_processed_seq. At every
 wake, reconcile saved unfinished sends before preparing another response.
 
 If the conversation cannot finish in the current turn, save a pending item with
-the same workspace identity, protected state directory, engagement_id,
+the same transport identity, protected state directory, engagement_id,
 last_processed_seq, the user's permitted negotiating scope, and an absolute
 follow-up deadline. Use the user's timing constraints; without a specified
 deadline, stop within 24 hours of starting follow-up. Never extend that
@@ -227,10 +234,9 @@ deadline on every scheduled run.
 
 Create or reuse one native scheduled routine dedicated to Needwing pending
 conversations. Persist its routine_id and look it up before creating another;
-do not create a routine for every conversation or reply. Use an interval of at
-least 5 minutes for Grok Bot; follow other hosts' scheduling limits. No
-subscription is required for this. Do not ask the user to copy a callback URL
-or key.
+do not create a routine for every conversation or reply. Follow the host's
+minimum scheduling interval. No subscription is required for this. Do not ask
+the user to copy a callback URL or key.
 
 Each scheduled run should:
 
@@ -257,7 +263,7 @@ For demo supplies, require the supplier's explicit final decision with its demo
 disclaimer. The requester's own acceptance is not a final supplier reply.
 If the host lacks a scheduler or the needed permission, say background
 follow-up is unavailable; do not promise an automatic later update. These
-pending items, routine_id and last_processed_seq are PA-local state, not new
+pending items, routine_id and last_processed_seq are local state, not new
 API parameters. Scheduled delivery follows the host's interval; do not promise
 instant updates.
 
@@ -273,7 +279,7 @@ registration option: the scheduled reads above cover it, and the server
 refuses a polling registration.
 
 - MCP Events: when the host can install an authenticated custom MCP
-  connection, subscribe on the same /mcp endpoint with the saved credential:
+  connection, subscribe on the same MCP address used for the conversation:
   events/list, then events/subscribe for engagement.updated. The host supplies
   the callback URL and signing secret; Needwing verifies a signed challenge
   before activating the subscription. Event payloads are pointers
@@ -297,7 +303,7 @@ Use the same gate for a scheduled routine when the user asks it to wait.
 While disarmed, the routine must only save pending events; do not negotiate or
 advance the processed seq. On the user's actual start instruction, persist
 armed=true, read the durable inbox/transcript, and resume from the saved seq,
-deduplicating updates. This is PA-local workflow state, not an API parameter.
+deduplicating updates. This is local workflow state, not an API parameter.
 Always ignore verification events for business actions, even when armed.
 
 For a demo negotiation, neither HTTP 2xx nor the requester's own acceptance is
@@ -346,13 +352,13 @@ Report 422 integration_unavailable instead of silently switching providers.
 
 Optional private sessions use a client-generated private_token (43–128 base64url
 characters) saved before creation and the same X-Session-Token on every
-per-session request. It is additional to Bearer authentication. See the HTTP
-guide; the ordinary workspace flow does not require a session token.
+per-session request. It is additional to the stored token. See the HTTP
+guide; the ordinary flow does not require a session token.
 
 The remote MCP endpoint needs no SDK, CLI package or local stdio server; a
 stdio distribution remains optional and would be separately versioned if ever
 supplied. The public Python client and HTTP work without any distribution.
-Existing ACTIONFLOW_* configuration remains stable for clients that use it.
-Named account keys share their account namespace; consumer selectors do not
-separate their traffic. Use protected ACTIONFLOW_API_URL and ACTIONFLOW_API_KEY
-settings, and leave ACTIONFLOW_CONSUMER_ID unset for ordinary account access.
+A verified account can create named keys (afk_…) on the website for developer
+servers and scripts; a named key authenticates direct HTTPS calls as
+Authorization: Bearer and is separate from the tokens the Python client
+manages.
