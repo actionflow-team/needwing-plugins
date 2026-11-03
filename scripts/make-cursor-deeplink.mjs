@@ -12,7 +12,10 @@
 import { Buffer } from "node:buffer";
 
 export const SERVER_NAME = "needwing";
-export const MCP_URL = "https://needwing.ai/mcp";
+// The address plugins install: the trial endpoint works for everyone — the
+// browser approval creates a trial account automatically, and a person
+// already signed in at needwing.ai approves their own account.
+export const MCP_URL = "https://needwing.ai/mcp/trial";
 
 /** The JSON configuration payload handed to Cursor. */
 export function cursorConfig() {

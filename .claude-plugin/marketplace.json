@@ -9,8 +9,8 @@
     {
       "name": "needwing",
       "source": "./plugins/needwing",
-      "description": "Ask Needwing to research, compare and recommend, with grounded evidence. Connects to https://needwing.ai/mcp over Streamable HTTP (OAuth sign-in by default).",
-      "version": "1.0.0",
+      "description": "Ask Needwing to research, compare and recommend, with grounded evidence. Connects to https://needwing.ai/mcp/trial over Streamable HTTP — the browser step creates a trial account automatically, and an existing account signs in in the browser (OAuth, discovered on first use).",
+      "version": "1.1.0",
       "author": {
         "name": "Needwing",
         "url": "https://needwing.ai"

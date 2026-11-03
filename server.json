@@ -3,12 +3,16 @@
   "name": "ai.needwing/needwing",
   "title": "Needwing",
   "description": "Grounded web and Agent-network research for any MCP client: answers with cited evidence.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "repository": {
     "url": "https://github.com/actionflow-team/needwing-plugins",
     "source": "github"
   },
   "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://needwing.ai/mcp/trial"
+    },
     {
       "type": "streamable-http",
       "url": "https://needwing.ai/mcp"

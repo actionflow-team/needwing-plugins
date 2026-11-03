@@ -1,6 +1,6 @@
 {
   "name": "needwing-plugins",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Needwing client plugins (Claude Code, Codex, Cursor, Gemini CLI) and MCP Registry metadata for the remote Needwing MCP endpoint.",

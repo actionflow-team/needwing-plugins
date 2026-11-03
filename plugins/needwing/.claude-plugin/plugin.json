@@ -1,8 +1,8 @@
 {
   "name": "needwing",
   "displayName": "Needwing",
-  "version": "1.0.0",
-  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Adds the remote Needwing MCP server (https://needwing.ai/mcp) and a research skill that submits bounded requests and reads typed results.",
+  "version": "1.1.0",
+  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Adds the remote Needwing MCP server (https://needwing.ai/mcp/trial) and a research skill that submits bounded requests and reads typed results.",
   "author": {
     "name": "Needwing",
     "url": "https://needwing.ai"

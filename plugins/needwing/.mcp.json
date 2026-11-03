@@ -2,7 +2,7 @@
   "mcpServers": {
     "needwing": {
       "type": "http",
-      "url": "https://needwing.ai/mcp"
+      "url": "https://needwing.ai/mcp/trial"
     }
   }
 }

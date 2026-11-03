@@ -4,7 +4,9 @@
 // Checks:
 //   1. every JSON manifest parses;
 //   2. each manifest carries the fields its format requires;
-//   3. every MCP URL equals the fixed remote endpoint https://needwing.ai/mcp;
+//   3. every plugin manifest installs the fixed trial endpoint
+//      https://needwing.ai/mcp/trial, and server.json lists exactly the two
+//      remote addresses (trial + sign-in https://needwing.ai/mcp);
 //   4. the bundled SKILL.md matches the sha256 recorded in skills.lock.json, and,
 //      when NEEDWING_HOMEPAGE_DIR names an af-homepage checkout, matches its
 //      `networkAgentSkill` source byte-for-byte;
@@ -20,10 +22,13 @@ import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MCP_URL = "https://needwing.ai/mcp";
+const TRIAL_URL = "https://needwing.ai/mcp/trial";
+// The single remote every plugin installs: the trial address works for everyone.
+const PLUGIN_URL = TRIAL_URL;
 const REGISTRY_SCHEMA = "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json";
 const REGISTRY_NAME = "ai.needwing/needwing";
 const REPO_URL = "https://github.com/actionflow-team/needwing-plugins";
-const PLUGIN_VERSION = "1.0.0";
+const PLUGIN_VERSION = "1.1.0";
 const SKILL_TS_SOURCE = process.env.NEEDWING_HOMEPAGE_DIR
   ? path.join(process.env.NEEDWING_HOMEPAGE_DIR, "apps/portal/src/lib/network-agent-skill.ts")
   : null;
@@ -121,7 +126,7 @@ for (const [label, manifest, file] of [
     const entry = manifest.mcpServers?.needwing;
     check(
       "cursor.mcpServers.needwing.url",
-      entry?.url === MCP_URL,
+      entry?.url === PLUGIN_URL,
       JSON.stringify(entry?.url),
     );
     check(
@@ -142,7 +147,7 @@ if (mcpJson) {
     entry?.type === "http" || entry?.type === "streamable-http",
     JSON.stringify(entry?.type),
   );
-  check(".mcp.json.needwing.url", entry?.url === MCP_URL, JSON.stringify(entry?.url));
+  check(".mcp.json.needwing.url", entry?.url === PLUGIN_URL, JSON.stringify(entry?.url));
   const headerValues = Object.values(entry?.headers ?? {});
   check(
     ".mcp.json.oauth-by-default",
@@ -163,7 +168,7 @@ if (geminiManifest) {
   check("gemini.name", geminiManifest.name === "needwing", JSON.stringify(geminiManifest.name));
   check("gemini.version", geminiManifest.version === PLUGIN_VERSION, JSON.stringify(geminiManifest.version));
   const entry = geminiManifest.mcpServers?.needwing;
-  check("gemini.mcpServers.needwing.httpUrl", entry?.httpUrl === MCP_URL, JSON.stringify(entry?.httpUrl));
+  check("gemini.mcpServers.needwing.httpUrl", entry?.httpUrl === PLUGIN_URL, JSON.stringify(entry?.httpUrl));
   check(
     "gemini.contextFileName",
     geminiManifest.contextFileName === "GEMINI.md",
@@ -171,7 +176,7 @@ if (geminiManifest) {
   );
   check("gemini.GEMINI.md present", existsSync(path.join(root, "gemini-extension/GEMINI.md")));
   const geminiMd = readText("gemini-extension/GEMINI.md");
-  check("gemini.GEMINI.md mentions the endpoint", Boolean(geminiMd?.includes(MCP_URL)));
+  check("gemini.GEMINI.md mentions the endpoints", Boolean(geminiMd?.includes(PLUGIN_URL) && geminiMd?.includes(MCP_URL)));
 }
 
 // --- 2e. MCP Registry server.json ----------------------------------------------
@@ -189,10 +194,18 @@ if (serverJson) {
   );
   check("server.json.version", serverJson.version === PLUGIN_VERSION, JSON.stringify(serverJson.version));
   check("server.json.repository.url", serverJson.repository?.url === REPO_URL, JSON.stringify(serverJson.repository));
-  const remote = serverJson.remotes?.[0];
-  check("server.json.remotes.length", serverJson.remotes?.length === 1);
-  check("server.json.remote.type", remote?.type === "streamable-http", JSON.stringify(remote?.type));
-  check("server.json.remote.url", remote?.url === MCP_URL, JSON.stringify(remote?.url));
+  const remotes = serverJson.remotes ?? [];
+  check("server.json.remotes.length", remotes.length === 2, JSON.stringify(remotes?.map((r) => r.url)));
+  check(
+    "server.json.remote.trial",
+    remotes[0]?.type === "streamable-http" && remotes[0]?.url === TRIAL_URL,
+    JSON.stringify(remotes[0]),
+  );
+  check(
+    "server.json.remote.sign-in",
+    remotes[1]?.type === "streamable-http" && remotes[1]?.url === MCP_URL,
+    JSON.stringify(remotes[1]),
+  );
 }
 
 // --- 2f. Codex repo marketplace --------------------------------------------------
@@ -223,7 +236,7 @@ if (pkg) {
   check("package.json.no-dependencies", !pkg.dependencies && !pkg.devDependencies);
 }
 
-// --- 3. every MCP URL in the repo equals the fixed endpoint -----------------------
+// --- 3. every MCP URL in the repo is one of the two fixed addresses ----------------
 
 const jsonFiles = [
   ".claude-plugin/marketplace.json",
@@ -246,7 +259,7 @@ for (const rel of jsonFiles) {
     if (node && typeof node === "object") {
       return Object.entries(node).forEach(([k, v]) => {
         const inside = inMcpContext || k === "mcpServers" || k === "remotes";
-        if (inside && (k === "url" || k === "httpUrl") && typeof v === "string" && /^https?:\/\//.test(v) && v !== MCP_URL) {
+        if (inside && (k === "url" || k === "httpUrl") && typeof v === "string" && /^https?:\/\//.test(v) && v !== MCP_URL && v !== TRIAL_URL) {
           strayUrls.push(`${rel}: ${k}=${v}`);
         }
         visit(v, inside);
@@ -255,7 +268,7 @@ for (const rel of jsonFiles) {
   };
   visit(JSON.parse(readFileSync(abs, "utf8")), false);
 }
-check("all-mcp-urls-equal-fixed-endpoint", strayUrls.length === 0, strayUrls.join("; "));
+check("all-mcp-urls-are-fixed-addresses", strayUrls.length === 0, strayUrls.join("; "));
 
 // --- 4. bundled skill vs skills.lock.json and the Homepage source -----------------
 
@@ -334,7 +347,7 @@ if (readme) {
     check("cursor-link.name", name === "needwing", name);
     check(
       "cursor-link.config.url",
-      config?.url === MCP_URL,
+      config?.url === PLUGIN_URL,
       JSON.stringify(config?.url),
     );
     const expectedB64 = Buffer.from(JSON.stringify(config), "utf8").toString("base64");
@@ -344,7 +357,12 @@ if (readme) {
       "base64 payload must be the standard encoding of the JSON config",
     );
   }
-  check("README mentions OAuth trial", /Try without an account|试用/i.test(readme));
+  check(
+    "README states the first question",
+    /Sign in · Create account · Try/.test(readme),
+  );
+  check("README installs the trial endpoint", readme.includes(TRIAL_URL));
+  check("README mentions the sign-in alternative", readme.includes(MCP_URL));
 }
 
 // --- report ------------------------------------------------------------------------

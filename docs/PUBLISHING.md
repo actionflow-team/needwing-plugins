@@ -10,7 +10,8 @@ Prerequisites:
 - The GitHub repository `actionflow-team/needwing-plugins` exists and this exact
   `server.json` is pushed (the registry stores metadata as published; `version` is
   immutable per publication).
-- `https://needwing.ai/mcp` is publicly reachable (the registry requires remote servers to
+- Both remote addresses, `https://needwing.ai/mcp` and `https://needwing.ai/mcp/trial`,
+  are publicly reachable (the registry requires remote servers to
   be publicly accessible; MCP auth makes an unauthenticated `initialize` fail by design —
   that is expected).
 
@@ -67,8 +68,10 @@ signs.)
 ## 5. Verify
 
 - Registry entry: browse `https://registry.modelcontextprotocol.io` for
-  `ai.needwing/needwing` v`1.0.0`.
-- `remotes[0]` must be `{"type": "streamable-http", "url": "https://needwing.ai/mcp"}`.
+  `ai.needwing/needwing` v`1.1.0`.
+- `remotes` must be exactly the two addresses:
+  `{"type": "streamable-http", "url": "https://needwing.ai/mcp/trial"}` and
+  `{"type": "streamable-http", "url": "https://needwing.ai/mcp"}`.
 
 ## Notes and constraints
 
