@@ -17,15 +17,41 @@ answer, and never skip it — it decides the connection path:
 
 Do you have a Needwing account? 1 Sign in · 2 Create one here · 3 Try without an account
 
-Then follow only the chosen path, with exactly one transport: if the host
-provides Needwing MCP tools (needwing_*), use them and nothing else;
-otherwise use the Python client over HTTPS. Never mix transports for one
-person, and never write credentials or tokens into MCP settings or connector
-configuration.
+Then follow only the chosen path, with exactly one transport, chosen MCP
+first:
+
+1. If the host already provides Needwing MCP tools (needwing_*):
+   use them and nothing else.
+2. Otherwise, if the host supports MCP (Claude Code, Codex, Cursor, Gemini
+   CLI, Qwen Code, Kimi and similar coding or working Agents), give the
+   person the exact add command for their host and chosen path, say the
+   session must be restarted (or the connector reconnected) before the
+   needwing_* tools appear, and stop. Do not run the Python client instead:
+   it is only for hosts without MCP, or when the person declines MCP.
+3. Only without MCP, or when the person declines it, use the Python client
+   over HTTPS.
+
+Never mix transports for one person, and
+never write credentials or tokens into MCP settings
+or connector configuration.
+
+The add commands on MCP-capable hosts (trial covers answers 2 and 3; the
+sign-in address is for answer 1):
+
+| Host | Try / Create (trial connector) | Sign in |
+| --- | --- | --- |
+| Claude Code | claude mcp add --transport http needwing-trial https://needwing.ai/mcp/trial — then the person runs /mcp and chooses Authenticate | claude mcp add --transport http needwing https://needwing.ai/mcp — then /mcp → Authenticate |
+| Codex | codex mcp add needwing-trial --url https://needwing.ai/mcp/trial then codex mcp login needwing-trial | codex mcp add needwing --url https://needwing.ai/mcp then codex mcp login needwing |
+| Cursor | add {"mcpServers":{"needwing-trial":{"url":"https://needwing.ai/mcp/trial"}}} to .cursor/mcp.json (or ~/.cursor/mcp.json), then the person clicks Connect in the MCP settings | the same JSON with https://needwing.ai/mcp, named needwing |
+| Any other MCP client | server URL https://needwing.ai/mcp/trial, Streamable HTTP, OAuth | server URL https://needwing.ai/mcp, Streamable HTTP, OAuth |
+
+The trial connector's window starts a trial account by itself; the sign-in
+address asks the person to sign in or register, then approve. For answer 2,
+after the restart continue in chat with needwing_sign_up and needwing_verify
+(the trial account becomes limited — see below).
 
 - Try: python3 needwing.py start — an anonymous trial account, no sign-up.
-  MCP: the person adds the https://needwing.ai/mcp/trial connector; its
-  window starts the trial automatically.
+  MCP: the https://needwing.ai/mcp/trial connector above.
 - Create one here: trial first (start or the trial connector), then in-chat
   sign-up. Run signup without --accept-terms to get the current Terms and
   Privacy links, show both links, and get an explicit yes — never accept for
@@ -44,9 +70,10 @@ Never open Needwing web pages yourself: no browser automation, and no
 filling of sign-in, sign-up, consent or activation forms. Give the person the
 link (and the code, when there is one) and wait. Email codes exist only for a
 new account the person asked to create here; never request or relay a code
-for an existing account. The sign-up reply never reveals whether the address
-already has an account — if the person says they already have one, switch to
-the sign-in path.
+for an existing account. Signing up with an address that already has an
+account fails fast: Needwing answers 409 email_registered, nothing is sent,
+and the client prints the sign-in step — run login, or on an MCP host the
+person reconnects the sign-in address and chooses Authenticate.
 
 Download and inspect the client once, keep it local, and reuse one persistent
 private state directory (--state-dir before the command) on every later run:
