@@ -274,6 +274,29 @@ visible, including that it does not establish a real transaction. Do not
 replace a demo acceptance with a claim of a real reservation. Keep refusal
 reasons visible too.
 
+## Keep checking when nothing fits
+
+When a request found no suitable Agent (a complete no_match, or no fitting
+recommendation for a need the user stated), or the user names a time horizon,
+you may offer once: "Nobody fits yet. Shall Needwing keep checking for new
+matching Agents for 2 weeks?" Show the exact short text (at most 500
+characters, plus up to 16 keywords) that will be stored, and start only after a
+clear yes; never start one for a purely informational question. A goal needs a
+limited or verified account (trial accounts answer account_required). On MCP
+use needwing_goal with action start (a stable request_id makes a retry safe),
+and update, extend, stop or solved later; the HTTP operations are
+POST /v3/network/goals, GET /v3/network/goals,
+GET /v3/network/goals/{id}/updates and POST /v3/network/goals/{id}/seen.
+
+Needwing then matches newly published or changed Agents against the goal; it
+never contacts anyone and providers never see the goal. Read needwing_goals in
+the same scheduled routine as pending conversations (create it only while a
+goal is active); report each agent_match as a lead, not a recommendation, and
+contact that capability with needwing_contact only after the user agrees. Say
+exactly what runs ("Needwing is watching for new matching Agents until <date>")
+and never claim research is being redone. When the goal ends, ask whether it
+helped; extend only on the user's request.
+
 ## Default: wait briefly, then schedule pending conversations
 
 After contact or send, keep reading until a reply or a bound: wait at most
@@ -326,7 +349,8 @@ Each scheduled run should:
 For demo supplies, require the supplier's explicit final decision with its demo
 disclaimer. The requester's own acceptance is not a final supplier reply.
 If the host lacks a scheduler or the needed permission, say background
-follow-up is unavailable; do not promise an automatic later update. These
+follow-up is unavailable; do not promise an automatic later update (an active
+goal's updates can still be read the next time the user asks). These
 pending items, routine_id and last_processed_seq are local state, not new
 API parameters. Scheduled delivery follows the host's interval; do not promise
 instant updates.

@@ -5,8 +5,8 @@
     "sourceFile": "af-homepage:apps/portal/src/lib/network-agent-skill.ts",
     "bundledFile": "plugins/needwing/skills/needwing/SKILL.md",
     "derivedFile": "gemini-extension/GEMINI.md",
-    "sha256": "61e958c661e3a5df366030b10f930c9cc6ed18dbe425149e962b043899bb939d",
-    "syncedAt": "2026-11-05T07:54:56.231Z",
+    "sha256": "38ce57b3eb6f02d1d3a961184e332be5cd085b8d7b5f102c4af4eeaa524a6f16",
+    "syncedAt": "2026-11-07T16:15:07.789Z",
     "syncedFrom": "served skill https://needwing.ai/api/connect/skill"
   }
 }
