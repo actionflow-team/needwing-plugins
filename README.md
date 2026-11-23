@@ -36,8 +36,10 @@ then run `/mcp` in Claude Code and choose Authenticate.
 
 ```bash
 codex plugin marketplace add actionflow-team/needwing-plugins
-codex plugin add needwing@needwing-plugins
 ```
+
+Then type `/plugins` in Codex, switch to the `needwing-plugins` marketplace, open `needwing` and choose
+Install plugin.
 
 Without the plugin:
 
