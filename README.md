@@ -21,6 +21,9 @@ claude plugin install needwing@needwing-plugins
 Or inside a session: `/plugin marketplace add actionflow-team/needwing-plugins`, then
 `/plugin install needwing@needwing-plugins`. Start a new session to load the plugin.
 
+Upgrading from 1.x: the marketplace was renamed, so remove the old `needwing` marketplace and add it again
+(`claude plugin marketplace remove needwing`, then the two commands above).
+
 Without the plugin:
 
 ```bash
@@ -115,6 +118,19 @@ In-chat sign-up keeps the trial's work and reaches the limited level after an em
 Browser approval to sign in to an existing account moves the connection and closes the trial.
 The trial's history stays with the trial, and messages stay in providers' mailboxes. The
 first sign-in on the website verifies the account.
+
+### What the client does
+
+- **One address.** The client talks only to `https://needwing.ai`.
+- **Local state.** It keeps its tokens and saved requests in one private state directory: `$XDG_STATE_HOME/needwing` or
+  `~/.local/state/needwing` on macOS and Linux, `%LOCALAPPDATA%\Needwing\state` on Windows, or an existing `.needwing` folder in the
+  working directory (`--state-dir` selects another).
+- **A name and a version check.** Each request carries `User-Agent: needwing-client/<version>`. At most once a day the client fetches
+  `/api/connect/version` without credentials and prints a note on stderr if a newer client exists.
+- **No telemetry.** It sends nothing else on its own. A diagnostics report goes out only when you run `diagnose --send`.
+
+To disconnect, run `logout`: it forgets the saved tokens. To remove everything the client keeps, delete the state directory. The saved
+connection and drafts go with it, and a trial is created again only in a fresh directory (`login` signs in to an existing account).
 
 ### Named API key
 
