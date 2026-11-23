@@ -25,18 +25,7 @@ def main():
     for source in assets:
         relative = source.relative_to(generated)
         bundled = Path("plugins") / relative if relative.parts[0] == "needwing" else relative
-        if relative in (Path("needwing/.mcp.json"), Path("needwing/mcp.json")):
-            # Preserve the host-specific transport declarations while using the generated URL.
-            expected = json.loads(source.read_text(encoding="utf-8"))
-            if relative.name == ".mcp.json":
-                expected["mcpServers"]["needwing"]["type"] = "http"
-            else:
-                expected["$schema"] = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
-                expected["mcpServers"]["needwing"]["type"] = "streamable-http"
-            matches = json.loads((root / bundled).read_text(encoding="utf-8")) == expected
-        else:
-            matches = (root / bundled).read_bytes() == source.read_bytes()
-        if not matches:
+        if (root / bundled).read_bytes() != source.read_bytes():
             parser.exit(1, f"{bundled} differs from the generated asset\n")
 
     versions = (args.service_root / "packages/contracts/src/client-version.ts").read_text(encoding="utf-8")
