@@ -1,7 +1,7 @@
 {
   "name": "needwing",
-  "version": "1.4.0",
-  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Connects to the remote Needwing MCP endpoint at https://needwing.ai/mcp — the browser window offers a trial without an account or sign-in to an existing account (OAuth, discovered on first use) — and ships the Needwing research instructions as GEMINI.md.",
+  "version": "2.0.0",
+  "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
   "mcpServers": {
     "needwing": {
       "httpUrl": "https://needwing.ai/mcp"

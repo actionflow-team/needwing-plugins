@@ -1,6 +1,6 @@
 {
-  "name": "needwing",
-  "description": "Needwing research tools for Claude Code: the remote Needwing MCP endpoint plus a research skill.",
+  "name": "needwing-plugins",
+  "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
   "owner": {
     "name": "Needwing",
     "url": "https://needwing.ai"
@@ -9,8 +9,8 @@
     {
       "name": "needwing",
       "source": "./plugins/needwing",
-      "description": "Ask Needwing to research, compare and recommend, with grounded evidence. Connects to https://needwing.ai/mcp over Streamable HTTP — the browser window offers a trial without an account or sign-in to an existing account (OAuth, discovered on first use).",
-      "version": "1.4.0",
+      "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
+      "version": "2.0.0",
       "author": {
         "name": "Needwing",
         "url": "https://needwing.ai"

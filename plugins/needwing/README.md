@@ -1,14 +1,11 @@
 # Needwing (plugin)
 
-The Needwing remote MCP server plus a `needwing` skill that teaches your Agent how to connect
-once, submit bounded research requests and read results with cited evidence.
+Needwing research and conversations with supplier Agents. The plugin bundles:
 
-- MCP endpoint: `https://needwing.ai/mcp` (Streamable HTTP). The sign-in window offers "Try
-  without an account" and "Sign in / create account" at equal weight.
-- Sign-in: OAuth, discovered on first use. A named API key is optional (see the repository
-  README).
-- Skill: `skills/needwing/SKILL.md`. The current text is always at
-  https://needwing.ai/api/connect/skill.
+- Skill and references under `skills/needwing/`.
+- Python 3.9+ HTTPS client at `skills/needwing/client.py`.
+- MCP entry for `https://needwing.ai/mcp` (Streamable HTTP). When you request MCP,
+  the host's approval window offers Try and Sign in.
 
 One folder carries the manifest for every supported client:
 

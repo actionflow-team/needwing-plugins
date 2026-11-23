@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "needwing",
-  "version": "1.4.0",
-  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Adds the remote Needwing MCP server (https://needwing.ai/mcp) and a research skill that submits bounded requests and reads typed results.",
+  "version": "2.0.0",
+  "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
   "author": {
     "name": "Needwing",
     "url": "https://needwing.ai"
@@ -10,5 +10,11 @@
   "homepage": "https://needwing.ai/connect",
   "repository": "https://github.com/actionflow-team/needwing-plugins",
   "license": "MIT",
-  "keywords": ["needwing", "research", "search", "recommendations", "mcp"]
+  "keywords": [
+    "needwing",
+    "research",
+    "search",
+    "recommendations",
+    "mcp"
+  ]
 }

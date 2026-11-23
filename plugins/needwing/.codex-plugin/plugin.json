@@ -1,7 +1,7 @@
 {
   "name": "needwing",
-  "version": "1.4.0",
-  "description": "Ask Needwing to research, compare and recommend, with grounded evidence and honest gaps. Adds the remote Needwing MCP server (https://needwing.ai/mcp) and a research skill.",
+  "version": "2.0.0",
+  "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
   "author": {
     "name": "Needwing"
   },
