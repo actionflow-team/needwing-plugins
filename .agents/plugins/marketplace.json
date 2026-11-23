@@ -1,0 +1,20 @@
+{
+  "name": "needwing-plugins",
+  "interface": {
+    "displayName": "Needwing Plugins"
+  },
+  "plugins": [
+    {
+      "name": "needwing",
+      "source": {
+        "source": "local",
+        "path": "./plugins/needwing"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
