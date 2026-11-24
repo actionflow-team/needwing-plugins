@@ -502,13 +502,19 @@ class Client:
         self.last_path = self.state / "last-task.json"
         self.tasks = self.state / "tasks"
         private_dir(self.tasks)
-        self.conversations = self.state / "conversations"
+        # This client's own conversation records live where the 2.1.0 client never looks: that client scans every file of
+        # `conversations/` and rewrites the one that matches, so what it left there is moved to `legacy-2.1/` (adopt_earlier_files).
+        self.conversations = self.state / "conversations-v2"
         private_dir(self.conversations)
+        self.earlier_conversations = self.state / "conversations"
+        self.legacy_root = self.state / "legacy-2.1"
+        self.legacy_conversations = self.legacy_root / "conversations"
+        self.legacy_pointer = self.legacy_root / "last-conversation.json"
         self.providers = self.state / "providers"
         private_dir(self.providers)
         self.tools = self.state / "tools"
         private_dir(self.tools)
-        self.last_conversation_path = self.state / "last-conversation.json"
+        self.last_conversation_path = self.state / "last-conversation.json"  # the earlier client's pointer: moved, never read here
         if not self.identity_path.exists():
             try:
                 write_private(self.identity_path, {"version": 2, "base_url": self.base}, exclusive=True)
@@ -920,6 +926,9 @@ class Client:
             return
         tokens = self.tokens()
         kind = (tokens or {}).get("kind") or "trial"
+        if self.earlier_refresh_marker(tokens) and not (kind == "trial" and self.request_id_recoverable()):
+            self.retry_earlier_refresh(tokens, kind)
+            return
         if kind == "trial" and self.request_id_recoverable():
             try:
                 self.register_trial(self.identity.get("client_name"))
@@ -933,6 +942,43 @@ class Client:
         self.forget_connection()
         raise self.reconnect_required(kind)
 
+    def earlier_refresh_marker(self, tokens):
+        """Whether the in-flight marker was left by an earlier client (2.1.0) for the pair saved now: that client wrote it before a
+        refresh it could no longer complete (Needwing refuses it below the minimum version), so the marker proves nothing about
+        whether the token was spent. This client's own markers carry its version and stay ambiguous until settled."""
+        marker = self.identity.get("refresh_in_flight")
+        token = (tokens or {}).get("refresh_token")
+        return (isinstance(marker, dict) and "client" not in marker and isinstance(token, str) and bool(token) and
+                marker.get("token_sha256") == hashlib.sha256(token.encode("utf-8")).hexdigest())
+
+    def retry_earlier_refresh(self, tokens, kind):
+        """Try the refresh once with the pair an earlier client's marker covers, instead of discarding it. An unspent token is
+        refreshed and the grant, and a trial past its replay window, stays. A spent one is answered `invalid_grant` and the person
+        reconnects, as before. Nothing the person still holds is revoked by this: Needwing revokes a refresh family only when a
+        spent token is replayed after its 60 second grace, and the only successor such a token can have is the pair of a refresh
+        whose answer was lost before the earlier client could save it, which nobody holds; inside the grace the same call returns
+        that pair instead. The marker is replaced by this client's own before the send (an unknown outcome is never retried), and
+        restored when the service refused before processing (429, 503, below the minimum version)."""
+        earlier = self.identity["refresh_in_flight"]
+        self.identity["refresh_in_flight"] = {
+            "token_sha256": earlier["token_sha256"], "started_at": int(time.time()), "client": CLIENT_VERSION}
+        write_private(self.identity_path, self.identity)
+        try:
+            result = self.call("POST", "/oauth/token", form={
+                "grant_type": "refresh_token", "client_id": OAUTH_CLIENT, "refresh_token": tokens["refresh_token"]})
+        except ClientError as exc:
+            if exc.payload.get("code") == "invalid_grant":
+                self.forget_connection()
+                raise self.reconnect_required(kind) from None
+            if exc.payload.get("http_status") in (429, 503) or exc.payload.get("code") == "upgrade_required":
+                self.identity["refresh_in_flight"] = earlier
+                write_private(self.identity_path, self.identity)
+            raise
+        if not isinstance(result.get("access_token"), str) or not result.get("access_token"):
+            raise ClientError("invalid_response",
+                              "The token response was incomplete. The refresh is treated as used: the next command recovers or asks to reconnect.")
+        self.save_tokens(result, kind, same_grant=True)
+
     def refresh_tokens(self):
         self.settle_refresh()
         tokens = self.tokens()
@@ -942,7 +988,7 @@ class Client:
         # Durable in-flight marker before the send: rotation may consume this token even if the response is lost.
         self.identity["refresh_in_flight"] = {
             "token_sha256": hashlib.sha256(tokens["refresh_token"].encode("utf-8")).hexdigest(),
-            "started_at": int(time.time())}
+            "started_at": int(time.time()), "client": CLIENT_VERSION}
         write_private(self.identity_path, self.identity)
         try:
             result = self.call("POST", "/oauth/token", form={
@@ -1050,8 +1096,8 @@ class Client:
                     "request_id" in self.identity and self.request_id_recoverable()):
                 self.register_trial(client_name or self.identity.get("client_name"))
             elif (set(self.identity) <= {"version", "base_url"} and
-                  not self.last_path.exists() and not self.last_conversation_path.exists() and
-                  not any(self.tasks.iterdir()) and not any(self.conversations.iterdir()) and not any(self.providers.iterdir()) and
+                  not self.last_path.exists() and not self.has_conversation_state() and
+                  not any(self.tasks.iterdir()) and not any(self.providers.iterdir()) and
                   not any(self.tools.iterdir())):
                 self.register_trial(client_name)
             else:
@@ -2073,10 +2119,51 @@ class Client:
         (an explicit id, the pointer, a repeated contact) ends here; the contact fingerprint and the pointer only index it."""
         return self.conversations / ("conv-" + account + "-" + conversation_id + ".json")
 
+    def has_conversation_state(self):
+        """Whether any conversation state exists here, this client's, an earlier client's, or already moved aside."""
+        return bool(self.last_conversation_path.exists() or self.legacy_root.exists() or any(self.conversations.iterdir()) or
+                    (self.earlier_conversations.is_dir() and any(self.earlier_conversations.iterdir())))
+
+    def adopt_earlier_files(self):
+        """Take what the earlier client (2.1.0) wrote out of its reach, before anything reads or writes conversation state: its
+        records (`conversations/*.json`) and its pointer (`last-conversation.json`) move, byte for byte, to `legacy-2.1/` with an
+        atomic rename each, and all reading of earlier state happens there. The earlier client then finds no cached receipt to
+        return and no record to overwrite. It cannot change anything at Needwing (its requests are refused below the minimum
+        version), so moving loses nothing; a file it writes later is moved by the next call. A file that names an account is this
+        client's own (an older build kept it there) and goes to its directory. A name already taken keeps the older file;
+        the newcomer is stored under another name: nothing is overwritten. Idempotent and crash-safe: a stop between two renames leaves every file in
+        exactly one place."""
+        if self.earlier_conversations.is_symlink() or self.last_conversation_path.is_symlink():
+            raise ClientError("unsafe_state", "Private state must not use symbolic links or reparse points.")
+        sources = sorted(self.earlier_conversations.glob("*.json")) if self.earlier_conversations.is_dir() else []
+        has_pointer = self.last_conversation_path.exists()
+        if not sources and not has_pointer:
+            return
+        for source in sources:
+            try:
+                if not stat.S_ISREG(source.lstat().st_mode):
+                    continue
+                value = read_private(source)
+            except FileNotFoundError:
+                continue
+            except (ClientError, OSError, ValueError):
+                value = None
+            own = isinstance(value, dict) and self.record_owner(value) is not None and not (self.conversations / source.name).exists()
+            directory = self.conversations if own else self.legacy_conversations
+            private_dir(directory)
+            target = directory / source.name
+            if target.exists():
+                # The file already moved keeps its name (and the identity its send is tracked by); the newcomer gets another.
+                target = directory / (source.stem + "." + str(time.time_ns()) + ".json")
+            os.replace(source, target)
+        if has_pointer:
+            private_dir(self.legacy_root)
+            os.replace(self.last_conversation_path, self.legacy_pointer)
+
     def legacy_records(self, conversation_id):
         """Records an earlier client (2.1.0) saved for this conversation: they name no account. Read only, never changed."""
         found = []
-        for candidate in sorted(self.conversations.glob("*.json")):
+        for candidate in sorted(self.legacy_conversations.glob("*.json")) if self.legacy_conversations.is_dir() else []:
             value = read_private(candidate)
             receipt = value.get("receipt") if isinstance(value, dict) else None
             if receipt_conversation(receipt) == conversation_id.lower() and self.record_owner(value) is None:
@@ -2122,6 +2209,56 @@ class Client:
             write_private(path, record)
         return record
 
+    def canonical_record(self, path, account, conversation_id):
+        """This account's existing canonical record at `path`, or None when there is none. It is checked at every way in (a repeated
+        contact, an earlier contact or pointer, an explicit id) before anything claims, merges, points at or returns it: an object,
+        written for this account, whose receipt names exactly the conversation expected. Anything else is `invalid_state`."""
+        if not path.exists():
+            return None
+        record = read_private(path)
+        named = record.get("conversation_id") if isinstance(record, dict) else None
+        if (not isinstance(record, dict) or receipt_conversation(record.get("receipt")) != conversation_id.lower() or
+                self.record_owner(record) != account or (named is not None and (not isinstance(named, str) or named.lower() != conversation_id.lower()))):
+            raise ClientError("invalid_state", "The saved conversation record does not belong to this account and conversation; nothing was sent.")
+        return record
+
+    def reconcile_sent(self, conversation_id, side, record):
+        """What the service says this side already sent, for a conversation adopted from earlier state: the earlier client's files
+        cannot say whether a message it replaced or lost was delivered, the service can. Every message entry of the own side (all
+        sides when the side is not known) is fenced content-free, as a hash of its text: the same text needs `send --new-message`.
+        Entries that cannot be read as text, or more than the pages read, fence every text (`legacy_send_any`)."""
+        hashes = set(record.get("legacy_send_sha256", []))
+        since, pages = 0, 0
+        while True:
+            query = {"since_seq": since, "limit": 100}
+            if side:
+                query["side"] = side
+            page = self.authorized("GET", "/v4/conversations/" + conversation_id + "/entries?" + parse.urlencode(query))
+            items = page.get("items") if isinstance(page, dict) else None
+            if not isinstance(items, list):
+                raise ClientError("invalid_response", "Expected an ordered conversation page; nothing was saved.")
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("seq"), int) or item["seq"] <= since:
+                    raise ClientError("invalid_response", "Conversation page has an invalid sequence; nothing was saved.")
+                since = item["seq"]
+                if item.get("kind") != "message" or (side and item.get("side") != side):
+                    continue
+                content = item.get("content")
+                parts = content.get("parts") if isinstance(content, dict) else None
+                texts = [part.get("text") for part in parts if isinstance(part, dict) and part.get("kind") == "text"] if isinstance(parts, list) else []
+                if not texts or not all(isinstance(text, str) for text in texts):
+                    record["legacy_send_any"] = True
+                hashes.update(hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts if isinstance(text, str))
+            if not (isinstance(page, dict) and page.get("has_more")):
+                break
+            pages += 1
+            if pages >= 20 or not items:
+                record["legacy_send_any"] = True
+                break
+        if hashes:
+            record["legacy_send_sha256"] = sorted(hashes)
+        record["server_reconciled"] = True
+
     def claim_legacy(self, legacies, account, conversation_id, side, unverified, as_contact):
         """Open this account's record of a conversation an earlier client saved without an account. The earlier files are never touched.
         Only after the service showed the conversation to this account is anything written, and only what is needed to act: the id,
@@ -2142,7 +2279,7 @@ class Client:
                     raise unverified
                 contact = lowered_receipt(contacts[0]["receipt"])
         path = self.conversation_path(account, conversation_id)
-        record = read_private(path) if path.exists() else None
+        record = self.canonical_record(path, account, conversation_id)
         if record is None or (contact is not None and not contact_receipt_usable(record.get("receipt"))):
             self.visible_to_account(conversation_id, unverified, "initiator" if contact is not None else side)
         if record is None:
@@ -2151,6 +2288,8 @@ class Client:
         if contact is not None and not contact_receipt_usable(record.get("receipt")):
             record["receipt"] = contact
             record["side"] = "initiator"
+        if not record.get("server_reconciled"):
+            self.reconcile_sent(conversation_id, record.get("side"), record)
         self.merge_legacy_sends(record, legacies)
         write_private(path, record)
         return path, record
@@ -2243,6 +2382,7 @@ class Client:
         self.resolve_account_change(confirm_account)
         capability_id = self.identifier(capability_id, "capability_id")
         self.message_text(text)
+        self.adopt_earlier_files()
         account = self.active_account()
         # The account is part of the identity of a contact: the same text to the same capability after a sign-in as another
         # account is another contact, never the first account's receipt. The fingerprint file is an index: before the answer it holds
@@ -2250,6 +2390,8 @@ class Client:
         fingerprint = hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
         path = self.conversations / (fingerprint + ".json")
         index = read_private(path) if path.exists() else None
+        if index is not None and (not isinstance(index, dict) or ("conversation_id" in index and not uuid_text(index["conversation_id"]))):
+            raise ClientError("invalid_state", "The saved contact is invalid; nothing was sent.")
         if index is not None and "receipt" in index and "conversation_id" not in index:
             # State written by an earlier client may hold a receipt: one that was never a receipt leaves the contact unconfirmed (replayed with its own ids).
             earlier = index.pop("receipt")
@@ -2281,8 +2423,8 @@ class Client:
                 raise uncertain_write("invalid_receipt", "The contact answer carried no usable conversation receipt; nothing was saved as sent.")
             result = lowered_receipt(result)
             conversation = self.conversation_path(account, result["conversation_id"])
-            if conversation.exists():
-                record = read_private(conversation)
+            record = self.canonical_record(conversation, account, result["conversation_id"])
+            if record is not None:
                 if not contact_receipt_usable(record.get("receipt")):
                     record["receipt"] = result
             else:
@@ -2294,8 +2436,8 @@ class Client:
         saved_id = index["conversation_id"].lower() if isinstance(index["conversation_id"], str) else index["conversation_id"]
         write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": saved_id})
         conversation = self.conversation_path(account, saved_id)
-        record = read_private(conversation) if conversation.exists() else None
-        if not isinstance(record, dict) or not contact_receipt_usable(record.get("receipt")):
+        record = self.canonical_record(conversation, account, saved_id)
+        if record is None or not contact_receipt_usable(record.get("receipt")):
             raise ClientError("invalid_state", "The saved contact has no conversation record; nothing was sent.")
         self.refresh_legacy_sends(conversation, record)
         return record["receipt"]
@@ -2306,7 +2448,7 @@ class Client:
         claim_legacy) and indexed under this account's fingerprint; one whose answer never came is never sent by this client: it may have
         been delivered, nothing says whose it is, and a replay under another account would be a second first message. Returns the index
         written at `path`, or None when there is no earlier contact."""
-        legacy_path = self.conversations / (hashlib.sha256(json.dumps([capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest() + ".json")
+        legacy_path = self.legacy_conversations / (hashlib.sha256(json.dumps([capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest() + ".json")
         if not legacy_path.exists():
             return None
         legacy = read_private(legacy_path)
@@ -2339,6 +2481,7 @@ class Client:
         """The one record this account resumes for a conversation, by explicit id or by its pointer. State of an earlier client (no
         account) is never changed: its conversation is opened for this account once the service shows it to the account (`side` names
         the side the person chose, which a credential acting on both sides needs)."""
+        self.adopt_earlier_files()
         account = self.active_account()
         unverified = ClientError(
             "legacy_conversation_unverified",
@@ -2354,14 +2497,14 @@ class Client:
                 if conversation_id is None:
                     # A contact whose answer is not known yet: only repeating it can settle it.
                     raise ClientError("conversation_uncertain", "Repeat the original contact command; keep the saved request and identity.")
-            elif self.last_conversation_path.exists():
-                # The pointer of an earlier client: read, never rewritten. Its conversation is opened by the same evidence.
-                pointer = read_private(self.last_conversation_path)
+            elif self.legacy_pointer.exists():
+                # The pointer of an earlier client (moved aside): read, never rewritten. Its conversation is opened by the same evidence.
+                pointer = read_private(self.legacy_pointer)
                 filename = pointer.get("record", "") if isinstance(pointer, dict) else None
                 if (not isinstance(filename, str) or not re.fullmatch(r"[a-f0-9]{64}\.json", filename) or
-                        not (self.conversations / filename).exists()):
+                        not (self.legacy_conversations / filename).exists()):
                     raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
-                earlier = read_private(self.conversations / filename)
+                earlier = read_private(self.legacy_conversations / filename)
                 receipt = earlier.get("receipt") if isinstance(earlier, dict) else None
                 if self.record_owner(earlier) is not None or not isinstance(receipt, dict) or not uuid_text(receipt.get("conversation_id")):
                     raise ClientError("conversation_uncertain", "The earlier client's contact has no recorded answer and is not sent again; see the contact command's guidance.",
@@ -2377,9 +2520,7 @@ class Client:
             conversation_id = self.identifier(conversation_id, "conversation_id")
         path = self.conversation_path(account, conversation_id)
         if path.exists():
-            # The record is checked (an object naming exactly this conversation) before anything reads it as one.
-            record = read_private(path)
-            self.record_of(path, record, conversation_id)
+            record = self.canonical_record(path, account, conversation_id)
             return path, self.refresh_legacy_sends(path, record)
         legacies = self.legacy_records(conversation_id)
         if legacies:
