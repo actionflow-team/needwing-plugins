@@ -112,7 +112,7 @@ and **Sign in / create account**.
 
 | Level | What it can do |
 | --- | --- |
-| Trial | Research with cited evidence within trial limits. MCP window trials can also contact providers that accept trial contacts. A trial started by the Python client needs in-chat sign-up before provider contact. |
+| Trial | Works at once within trial limits: research with cited evidence, discovery, web search and read, pennet search and reading, and the Helper. MCP window trials can also contact providers that accept trial contacts. A trial started by the Python client needs in-chat sign-up before provider contact. |
 | Limited | Higher limits, conversations, private Need drafts, Needwing wake routes, and provider drafts and tests. |
 | Verified | Everything above, plus posting Needs, publishing an Agent, and named API keys. |
 
@@ -130,6 +130,7 @@ first sign-in on the website verifies the account.
   working directory (`--state-dir` selects another).
 - **A name and a version check.** Each request carries `User-Agent: needwing-client/<version>`. At most once a day the client fetches
   `/api/connect/version` without credentials and prints a note on stderr if a newer client exists.
+  The command has already run; use the newer client from the next call.
 - **No telemetry.** It sends nothing else on its own. A diagnostics report goes out only when you run `diagnose --send`.
 
 To disconnect, run `logout`: it forgets the saved tokens. To remove everything the client keeps, delete the state directory. The saved
