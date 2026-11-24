@@ -67,6 +67,7 @@ import errno
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -2064,27 +2065,33 @@ class Client:
         return self.state / ("last-conversation-" + account + ".json")
 
     def marker_sequence(self):
-        """The sequence stored in the ambiguity marker; None when there is no marker. A marker that cannot be read, or that names
-        no sequence, counts as 0: it still invalidates every pointer that names no later sequence."""
+        """The sequence stored in the ambiguity marker; None when there is no marker. A marker that cannot be read, or that holds no
+        valid sequence, cannot order anything: it counts as later than every pointer (infinity), so no default is used until a
+        selection rewrites it."""
         if not self.pointer_ambiguous_path.exists():
             return None
         try:
             value = read_private(self.pointer_ambiguous_path).get("seq")
         except (ClientError, OSError, ValueError, AttributeError):
-            return 0
-        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+            return math.inf
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else math.inf
 
     def write_pointer(self, account, fields):
         """Write an account's pointer with a sequence that is later than the ambiguity marker's: a pointer written now is a choice
-        made after the ambiguity and is used by default; one written before it is not."""
+        made after the ambiguity and is used by default; one written before it is not. A marker that cannot be read is rewritten first
+        (later than every pointer), so the selection is the first choice after it."""
         marker = self.marker_sequence()
+        if marker == math.inf:
+            self.mark_pointer_ambiguous()
+            marker = self.marker_sequence()
         write_private(self.pointer_path(account), {**fields, "account_id": account,
                                                    "seq": max(time.time_ns(), (marker or 0) + 1)})
 
     def mark_pointer_ambiguous(self):
         """Persist the decision that no earlier default is known: the marker's sequence is later than every account pointer's and than
         the marker's own, so every default chosen before this point must be named again."""
-        latest = self.marker_sequence() or 0
+        existing = self.marker_sequence()
+        latest = existing if isinstance(existing, int) else 0
         for candidate in self.state.glob("last-conversation-*.json"):
             try:
                 value = read_private(candidate).get("seq")
@@ -2134,7 +2141,7 @@ class Client:
         client's own (an older build kept it there) and goes to its directory. A name already taken keeps the older file;
         the newcomer is stored under another name: nothing is overwritten. The default pointer is moved the same way: an
         earlier pointer already moved is never replaced, and an incoming pointer whose file collided is ambiguous (it names the
-        older file but meant the newcomer), and so is one that cannot be read as naming a file. Either way the incoming one is kept
+        older file but meant the newcomer), and so is one that cannot be read as naming a file, and any incoming pointer while this client already holds a default of any account. Either way the incoming one is kept
         beside it and `pointer-ambiguous.json` (with a sequence) is written before any file moves: no default is used that was
         chosen before it (the conversation must be named). Idempotent and crash-safe: a stop between two writes leaves every file in
         exactly one place and the decision on disk; a resumed move finds the marker, which no default chosen before it outlives."""
@@ -2152,7 +2159,8 @@ class Client:
             except (ClientError, OSError, ValueError, AttributeError):
                 named = None
             names = {source.name for source in sources}
-            ambiguous = (not isinstance(named, str) or self.legacy_pointer.exists() or
+            # An incoming earlier pointer next to any default of this client cannot be shown to select the same conversation.
+            ambiguous = (not isinstance(named, str) or self.legacy_pointer.exists() or any(self.state.glob("last-conversation-*.json")) or
                          (named in names and ((self.conversations / named).exists() or (self.legacy_conversations / named).exists())))
             if ambiguous:
                 self.mark_pointer_ambiguous()
