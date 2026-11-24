@@ -2295,7 +2295,7 @@ class Client:
         write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": saved_id})
         conversation = self.conversation_path(account, saved_id)
         record = read_private(conversation) if conversation.exists() else None
-        if record is None or not contact_receipt_usable(record.get("receipt")):
+        if not isinstance(record, dict) or not contact_receipt_usable(record.get("receipt")):
             raise ClientError("invalid_state", "The saved contact has no conversation record; nothing was sent.")
         self.refresh_legacy_sends(conversation, record)
         return record["receipt"]
@@ -2377,8 +2377,10 @@ class Client:
             conversation_id = self.identifier(conversation_id, "conversation_id")
         path = self.conversation_path(account, conversation_id)
         if path.exists():
-            record = self.refresh_legacy_sends(path, read_private(path))
-            return self.record_of(path, record, conversation_id)
+            # The record is checked (an object naming exactly this conversation) before anything reads it as one.
+            record = read_private(path)
+            self.record_of(path, record, conversation_id)
+            return path, self.refresh_legacy_sends(path, record)
         legacies = self.legacy_records(conversation_id)
         if legacies:
             path, record = self.claim_legacy(legacies, account, conversation_id, side, unverified, False)
