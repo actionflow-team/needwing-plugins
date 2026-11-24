@@ -2057,7 +2057,7 @@ class Client:
             value = read_private(candidate)
             receipt = value.get("receipt") if isinstance(value, dict) else None
             if isinstance(receipt, dict) and receipt.get("conversation_id") == conversation_id and self.record_owner(value) is None:
-                found.append(value)
+                found.append((candidate.name, value))
         return found
 
     def claim_legacy(self, legacies, account, side, unverified):
@@ -2067,12 +2067,12 @@ class Client:
         for every message the earlier client sent (a hash of its text, never the text). Its cursor, transcript and metadata are not
         imported (they may belong to the other participant): the record starts at cursor zero and is rebuilt from what Needwing returns
         to this account. Returns (path, record)."""
-        first = legacies[0]
+        first = legacies[0][1]
         receipt = first.get("receipt")
         conversation_id = receipt.get("conversation_id") if isinstance(receipt, dict) else None
         if not uuid_text(conversation_id):
             raise unverified
-        contacts = [legacy for legacy in legacies if isinstance(legacy.get("body"), dict)]
+        contacts = [legacy for _, legacy in legacies if isinstance(legacy.get("body"), dict)]
         if contacts and not contact_receipt_usable(contacts[0].get("receipt")):
             raise unverified
         path = self.conversation_path(account, conversation_id)
@@ -2084,8 +2084,14 @@ class Client:
         if contacts and not contact_receipt_usable(record.get("receipt")):
             record["receipt"] = contacts[0]["receipt"]
             record["side"] = "initiator"
+        # Each earlier file is imported once: what the record consumed from it since (a fence lifted by --new-message) is never reinstated
+        # by a later index (a repeated contact, the earlier pointer).
+        imported = set(record.get("legacy_imported", []))
         hashes, unreadable = set(record.get("legacy_send_sha256", [])), bool(record.get("legacy_send_any"))
-        for legacy in legacies:
+        for name, legacy in legacies:
+            if name in imported:
+                continue
+            imported.add(name)
             pending = legacy.get("last_send")
             if not isinstance(pending, dict):
                 continue
@@ -2093,6 +2099,7 @@ class Client:
                 hashes.add(hashlib.sha256(pending["body"]["parts"][0]["text"].encode("utf-8")).hexdigest())
             except (KeyError, IndexError, TypeError, AttributeError):
                 unreadable = True
+        record["legacy_imported"] = sorted(imported)
         if hashes:
             record["legacy_send_sha256"] = sorted(hashes)
         if unreadable:
@@ -2263,7 +2270,7 @@ class Client:
         if not contact_receipt_usable(legacy.get("receipt")):
             raise unverified
         conversation_id = legacy["receipt"]["conversation_id"]
-        self.claim_legacy(self.legacy_records(conversation_id) or [legacy], account, "initiator", unverified)
+        self.claim_legacy(self.legacy_records(conversation_id) or [(legacy_path.name, legacy)], account, "initiator", unverified)
         index = {"account_id": account, "conversation_id": conversation_id}
         write_private(path, index)
         return index
@@ -2304,7 +2311,7 @@ class Client:
                 if self.record_owner(earlier) is not None or not isinstance(receipt, dict) or not uuid_text(receipt.get("conversation_id")):
                     raise ClientError("conversation_uncertain", "The earlier client's contact has no recorded answer and is not sent again; see the contact command's guidance.",
                                       guidance=["Its answer may have been lost after delivery: look for it in this account's conversations (GET /v4/conversations), or repeat the contact command with --new-conversation to send a new one deliberately."])
-                path, record = self.claim_legacy(self.legacy_records(receipt["conversation_id"]) or [earlier], account, side, unverified)
+                path, record = self.claim_legacy(self.legacy_records(receipt["conversation_id"]) or [(filename, earlier)], account, side, unverified)
                 write_private(pointer_path, {"account_id": account, "conversation_id": receipt["conversation_id"]})
                 return self.record_of(path, record, receipt["conversation_id"])
             else:
@@ -2336,27 +2343,31 @@ class Client:
             # about replacing the record: the original message id stays and --new-message cannot discard it.
             pending.pop("receipt", None)
             write_private(path, record)
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if record.get("legacy_send_any") is True or digest in record.get("legacy_send_sha256", []):
-            # An earlier client sent this message (or one it cannot tell apart): whether it arrived is not known to this client, so the
-            # same text is never sent again on its own. A different text is not affected.
-            if not new_message:
+        same_text = bool(pending) and pending["body"]["parts"] == [{"kind": "text", "text": text}]
+        if pending and "receipt" not in pending:
+            # A message of this client whose answer is unknown comes first: it is replayed under its own id, or nothing else is sent.
+            if not same_text or new_message:
+                raise ClientError("message_uncertain", "Reconcile the previous message with its original text before sending a new one.")
+        elif not pending or new_message or not same_text:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            fenced = record.get("legacy_send_any") is True or digest in record.get("legacy_send_sha256", [])
+            if fenced and not new_message:
+                # An earlier client sent this message (or one it cannot tell apart): whether it arrived is not known to this client, so the
+                # same text is never sent again on its own. A different text is not affected.
                 raise ClientError(
                     "legacy_message_unverified",
                     "A message like this was already sent by an earlier client version: it may have been delivered, so it is not sent again automatically.",
                     guidance=["Read the conversation to see whether it arrived.",
                               "To send this message deliberately (it may duplicate the earlier one), repeat the command with --new-message."])
-            record.pop("legacy_send_any", None)
-            remaining = [item for item in record.pop("legacy_send_sha256", []) if item != digest]
-            if remaining:
-                record["legacy_send_sha256"] = remaining
-            write_private(path, record)
-        if pending and "receipt" not in pending:
-            if pending["body"]["parts"] != [{"kind": "text", "text": text}] or new_message:
-                raise ClientError("message_uncertain", "Reconcile the previous message with its original text before sending a new one.")
-        elif not pending or new_message or pending["body"]["parts"] != [{"kind": "text", "text": text}]:
             pending = {"body": {"client_message_id": "needwing-" + str(uuid.uuid4()), "parts": [{"kind": "text", "text": text}]}}
             record["last_send"] = pending
+            if fenced:
+                # The fence is lifted in the same write that saves the deliberate message and its id: a refusal or an interruption before
+                # it leaves the fence in place.
+                record.pop("legacy_send_any", None)
+                remaining = [item for item in record.pop("legacy_send_sha256", []) if item != digest]
+                if remaining:
+                    record["legacy_send_sha256"] = remaining
             write_private(path, record)
         if "receipt" not in pending:
             receipt = self.authorized("POST", "/v4/conversations/" + target + "/messages", pending["body"])
