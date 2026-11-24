@@ -2045,29 +2045,43 @@ class Client:
             return None
         return self.conversations / (hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest() + ".json")
 
-    def claim_legacy(self, legacy, account, side, unverified):
-        """Use state an earlier client (2.1.0) saved without an account. The earlier file is never touched. A delivered contact is
-        copied whole (body, receipt, pending follow-up, cursor, saved entries) into this account's own record, but only after the
-        service showed the conversation to this account (on the initiator side for a contact: the earlier client only ever started
-        contacts); the account's own record, when there is one, wins. Returns (path, record)."""
+    def claim_legacy(self, legacy, account, side, unverified, by_id=False):
+        """Use state an earlier client (2.1.0) saved without an account. The earlier file is never touched, and nothing it cached about
+        the conversation is imported (its cursor, transcript and metadata could belong to the other participant: the new record starts at
+        cursor zero and is rebuilt from what Needwing returns to this account). Only what is needed to act is copied, and only after the
+        service showed the conversation to this account (initiator side for a contact: the earlier client only ever started contacts):
+        the ids and receipt, a contact's own body and last message, and the fence of a message whose answer was never seen.
+        `by_id` keeps the copy out of the contact fingerprint (an explicit id resolves by account and conversation id only). Returns (path, record)."""
         receipt = legacy.get("receipt") if isinstance(legacy, dict) else None
         conversation_id = receipt.get("conversation_id") if isinstance(receipt, dict) else None
         body = legacy.get("body") if isinstance(legacy, dict) else None
         contact = isinstance(body, dict)
         if not uuid_text(conversation_id) or (contact and not contact_receipt_usable(receipt)):
             raise unverified
-        path = self.account_record_path(account, body) if contact else self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
-        if path is None:
-            raise unverified
+        by_id_path = self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
+        path = by_id_path
+        if contact and not by_id:
+            path = self.account_record_path(account, body)
+            if path is None:
+                raise unverified
+            if path.exists():
+                existing = read_private(path)
+                if (existing.get("receipt") or {}).get("conversation_id") == conversation_id:
+                    return path, existing
+                path = by_id_path  # that fingerprint belongs to another conversation of this account
         if path.exists():
             return path, read_private(path)
         self.visible_to_account(conversation_id, unverified, "initiator" if contact else side)
-        record = json.loads(json.dumps(legacy))
-        record["account_id"] = account
-        pending = record.get("last_send")
+        record = {"account_id": account, "receipt": receipt}
+        pending = legacy.get("last_send")
+        if contact:
+            record["body"] = body
+            if isinstance(pending, dict):
+                record["last_send"] = json.loads(json.dumps(pending))
         if isinstance(pending, dict) and not (isinstance(pending.get("receipt"), dict) and message_receipt_usable(pending["receipt"])):
             # A follow-up of the earlier client whose answer is unknown: it may have been delivered, so it is never sent again on its own.
-            pending["legacy_unconfirmed"] = True
+            # Only the fence is kept for a record whose side is not known; its text is not copied.
+            record["last_send"] = {**record.get("last_send", {}), "legacy_unconfirmed": True}
         write_private(path, record)
         return path, record
 
@@ -2216,6 +2230,14 @@ class Client:
             raise unverified
         return self.claim_legacy(legacy, account, "initiator", unverified)[1]
 
+    @staticmethod
+    def record_of(path, record, conversation_id):
+        """An explicit id acts only on the record of exactly that conversation: anything else is refused before a request is made."""
+        receipt = record.get("receipt") if isinstance(record, dict) else None
+        if not isinstance(receipt, dict) or receipt.get("conversation_id") != conversation_id:
+            raise ClientError("invalid_state", "The saved record does not belong to the conversation named; nothing was sent.")
+        return path, record
+
     def conversation_record(self, conversation_id=None, side=None):
         """The saved record this account resumes: by explicit id or by its last-conversation pointer. State of an earlier client (no
         account) is never changed; it is copied into this account's own record once the service shows the conversation to the account
@@ -2237,17 +2259,18 @@ class Client:
                     continue
                 owner = self.record_owner(value)
                 if owner == account:
-                    return candidate, value
+                    return self.record_of(candidate, value, conversation_id)
                 if owner is None:
                     earlier.append(value)
             if earlier:
-                return self.claim_legacy(earlier[0], account, side, unverified)
-            # Nothing is saved for this account before Needwing showed the conversation to it.
-            self.visible_to_account(conversation_id, None, side)
-            path = self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
-            record = {"account_id": account, "receipt": {"conversation_id": conversation_id}}
-            write_private(path, record)
-            return path, record
+                path, record = self.claim_legacy(earlier[0], account, side, unverified, by_id=True)
+            else:
+                # Nothing is saved for this account before Needwing showed the conversation to it.
+                self.visible_to_account(conversation_id, None, side)
+                path = self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
+                record = {"account_id": account, "receipt": {"conversation_id": conversation_id}}
+                write_private(path, record)
+            return self.record_of(path, record, conversation_id)
         pointer_path = self.pointer_path(account)
         if pointer_path.exists():
             pointer = read_private(pointer_path)
