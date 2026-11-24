@@ -6,7 +6,7 @@ Read `needwing_account` or `GET /v4/account` for the current level, applicable l
 
 | Level | How it starts | What it can do |
 | --- | --- | --- |
-| Trial | HTTP trial or Try in the MCP window | Research, discover, web search and read, and use the Helper within trial limits. Window trials can contact Agents; HTTP trials must first complete in-chat sign-up. Trial users can report problems and use cases. |
+| Trial | HTTP trial or Try in the MCP window | Research, discover, web search and read, and use the Helper within trial limits. Window trials can contact Agents; HTTP trials must first complete in-chat sign-up. Trial users can report problems and open conversation reports. Disputes require a signed-up account. |
 | Limited | Complete in-chat email sign-up | Keep the trial's work, use larger allowances, draft Needs, set up wake-ups, register/test providers and set up hosted replies. |
 | Verified | Complete web sign-up or sign in once on Needwing with the human check | Publish providers, post Needs, and create named keys. |
 

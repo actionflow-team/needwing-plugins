@@ -11,7 +11,9 @@ signup   print the Terms/Privacy links (--email is only needed together with
          account in chat once the person explicitly agrees
 verify   confirm the 6-digit code the person read from their own email
 login    sign in to an existing account; the person approves in their browser
-         (from a trial, approval closes the trial and moves the connection)
+         (from a trial, approval closes the trial and moves the connection to
+         the approving account, which the person then confirms with
+         --confirm-account on the next command)
 account  show the calling account's level, limits and next steps
 provider register, test and publish this Agent's own supply: register (a
          draft card), probe (the channel proof), confirm, publish and status;
@@ -27,11 +29,14 @@ Access tokens expire after about an hour; the client refreshes them
 automatically (with rotation) and never prints them. A refresh token is marked
 in flight on disk before it is sent and never sent twice: after a lost
 response or a crash, a trial under 24 hours old replays its registration and
-anything else asks the person to reconnect. signup submits exactly the Terms
+anything else asks the person to reconnect. A credential Needwing retired is
+cleared the same way; only HTTP 426 means this client is too old (exit 3).
+signup submits exactly the Terms
 version it showed. A trial can research within its limits. Contact from a
 trial started by this client requires sign-up (signup, then verify). Verified
 accounts can supply a named key in NEEDWING_API_KEY when no OAuth token is
-saved. The same credential powers research, discovery, conversations, and
+saved; connect waits while a requested sign-in or a logout is still saved
+and says so. The same credential powers research, discovery, conversations, and
 the provider registration, probe and publishing flow.
 
 Keep the user's natural request and constraints. Needwing searches its supply
@@ -157,7 +162,8 @@ DERIVED = object()
 A2A_CARD_FIELDS = ("card_url", "endpoint_challenge_id", "skill_id", "protocol_version")
 CARD_FIELDS = frozenset({"provider_external_id", "display_name", "capability_external_id", "description",
                          "keywords", "reply_window_seconds", "visibility", "channel", "conversation",
-                         "card_url", "endpoint_challenge_id", "skill_id", "protocol_version"})
+                         "card_url", "endpoint_challenge_id", "skill_id", "protocol_version",
+                         "accept_trial_contacts"})
 
 
 class ClientError(Exception):
@@ -580,6 +586,48 @@ class Client:
             guidance=["Run " + cli("connect") + " in this same state directory to check or recover the connection; only fresh state creates a trial.",
                       "For an explicit sign-in request, run " + cli("login") + ". Never delete saved state to create another identity."])
 
+    def pending_connection(self):
+        """`connect`'s refusal while a saved marker waits for the person's explicit request: says
+        what waits and which command ends it. A named key in the host changes nothing here (the
+        saved state comes first and nothing is sent), so the refusal says what the key means.
+        The key is configured either way; whether it is effective depends on what else is
+        saved. With no saved connection it is the credential of the other commands, and the
+        state cannot be resolved until the person unsets it. Next to a saved connection (a
+        token pair, or its refresh in flight) it is not effective at all: that connection
+        takes priority, no command sends the key and nothing has to be unset."""
+        login, start = cli("login"), cli("start")
+        if self.identity.get("trial_sign_in"):
+            waits = "a trial sign-in that waits for the person's approval in the browser"
+            ends = login + " finishes that sign-in"
+        else:
+            waits = "a sign-in request the person has not approved yet" if self.identity.get("login_requested") else "a logout"
+            ends = login + " signs in to an existing account, or " + start + " creates or resumes a trial"
+        message = "A requested sign-in or logout needs an explicit next step; no trial was created."
+        guidance = ["The next step is the person's to request: " + ends + "."]
+        key = os.environ.get("NEEDWING_API_KEY")
+        if key and not self.api_key():
+            message = ("This state directory holds " + waits + ", which needs an explicit next step. NEEDWING_API_KEY is configured "
+                       "in the host but is not effective here: the saved connection (its OAuth tokens) of this state directory takes "
+                       "priority, so no command uses the key; nothing was sent and no trial was created.")
+            guidance += [
+                "The key is configured but not effective, and nothing has to be unset before the next step: commands use the saved "
+                "connection, not the key.",
+                "Keep setup pending until the person explicitly requests sign-in or trial access; do not launch login automatically.",
+            ]
+        elif key:
+            message = ("This state directory holds " + waits + ", which needs an explicit next step. NEEDWING_API_KEY is set, "
+                       "but connect ignores that key until the saved state is resolved; nothing was sent and no trial was created.")
+            guidance += [
+                "Resolving it takes the key out first: login, start and logout refuse while NEEDWING_API_KEY is set, "
+                "so the person unsets it in the host before that command.",
+                "Meanwhile the key itself is ready: the other commands use it as it is, and " + cli("account") +
+                " checks that connection.",
+                "Do not unset the key, launch login or start a trial on your own.",
+            ]
+        else:
+            guidance.append("Keep setup pending until the person explicitly requests sign-in or trial access; do not launch login automatically.")
+        return ClientError("connection_pending", message, guidance=guidance)
+
     # ---- transport ---------------------------------------------------------
 
     def call(self, method, path, body=None, idempotency_key=None, form=None, expected_account=None):
@@ -607,6 +655,12 @@ class Client:
             if isinstance(access, str) and access:
                 headers["Authorization"] = "Bearer " + access
         req = request.Request(self.base + path, data=data, headers=headers, method=method)
+        # What this request carries of the saved pair: its access token as the bearer, or
+        # its refresh token in a refresh's form. An anonymous request carries neither.
+        pair = self.tokens()
+        carries_pair = "Authorization" in headers and pair is not None
+        refreshes_pair = (path == "/oauth/token" and pair is not None and isinstance(form, dict) and
+                          form.get("grant_type") == "refresh_token" and form.get("refresh_token") == pair.get("refresh_token"))
         # A write's answer that is lost, cut off, empty or unusable proves nothing about whether it was recorded.
         write = method != "GET" and not path.startswith("/oauth/") and path not in READ_ONLY_POSTS
         uncertain = list(UNCERTAIN_WRITE_GUIDANCE) if write else []
@@ -637,17 +691,44 @@ class Client:
             upgrade_step = next((step for step in next_steps
                                  if isinstance(step, dict) and step.get("action") == "download_client"), None
                                 ) if isinstance(next_steps, list) else None
-            if exc.code == 426 or rfc_code == "upgrade_required" or detail.get("code") == "upgrade_required" or upgrade_step:
+            # Do not echo arbitrary server messages, request bodies or credentials.
+            code = detail.get("code", rfc_code or "http_error")
+            if not isinstance(code, str) or not re.fullmatch(r"[a-zA-Z0-9_:-]{1,80}", code):
+                code = "http_error"
+            # Needwing attaches its download step to two different refusals. HTTP 426 says this
+            # program is below the minimum (Needwing answers it before anything else, so a
+            # client that got as far as another status is not), and invalid_target answers a
+            # request for the retired audience, which this client never sends: both are for the
+            # program to fix. The body's own code says less than its status: the 401 below
+            # carries `upgrade_required` too.
+            if exc.code == 426 or (upgrade_step and code == "invalid_target"):
                 message = detail.get("message") or envelope.get("message") or envelope.get("error_description")
                 if not isinstance(message, str) or not message.isprintable() or not 0 < len(message) <= 400:
                     message = "Download the current Needwing client and start again."
                 url = self.safe_next_url((upgrade_step or {}).get("url")) or self.base + CLIENT_PATH
                 raise ClientError("upgrade_required", message, http_status=exc.code,
                                   guidance=["Download the current client: " + url]) from None
-            # Do not echo arbitrary server messages, request bodies or credentials.
-            code = detail.get("code", rfc_code or "http_error")
-            if not isinstance(code, str) or not re.fullmatch(r"[a-zA-Z0-9_:-]{1,80}", code):
-                code = "http_error"
+            if upgrade_step and (exc.code == 401 and (carries_pair or refreshes_pair) or
+                                 code == "invalid_grant" and refreshes_pair):
+                # Only these two refusals are about the saved pair, not about the program:
+                # Needwing sends the step when a pair issued for the retired audience is
+                # used (the 401 of the request that carried it) or refreshed (the
+                # invalid_grant of that refresh). A 401 refuses the credential the request
+                # presented, so the refresh's own 401 counts as well as the bearer's, and
+                # invalid_grant counts on any status. Such a pair is revoked, so it is
+                # forgotten here (a trial inside the replay window keeps its request id,
+                # and `connect` replays its registration) and the person reconnects. Read
+                # as "download the client" instead, a current client repeated this
+                # refusal on every command and `login` answered already_signed_in; only
+                # a manual logout got out. Any other refusal that carries the step says
+                # nothing about the pair, so the pair stays: an anonymous request (the
+                # version check, a device sign-in, a registration) carries none of it,
+                # and the step on another status belongs to that request alone.
+                kind = pair.get("kind") or self.identity.get("connection_kind") or "trial"
+                self.forget_connection()
+                raise self.reconnect_required(
+                    kind, "Needwing retired the credential saved in this state directory, so the local tokens were cleared. "
+                          "The client is not too old; there is nothing to download. Reconnect; nothing was resent.") from None
             request_id = detail.get("request_id") or exc.headers.get("x-request-id")
             safe_id = request_id if isinstance(request_id, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", request_id) else None
             guidance = []
@@ -769,12 +850,15 @@ class Client:
             # quota, an uncertain transport) is the result the caller must see.
             raise exc from None
 
-    def reconnect_required(self, kind):
+    def reconnect_required(self, kind, reason=None):
+        """The saved pair is gone and the person reconnects. `reason` replaces the message
+        when the pair was not lost in a refresh (a credential Needwing retired)."""
         return ClientError(
             "reconnect_required",
-            "The saved sign-in can no longer be refreshed safely, so the local tokens were cleared. Reconnect; nothing was resent.",
+            reason or "The saved sign-in can no longer be refreshed safely, so the local tokens were cleared. Reconnect; nothing was resent.",
             guidance=[("Run " + cli("connect") + " to recover the same trial while its saved request is under 24 hours old."
-                       if kind == "trial" else "The saved account needs an explicit sign-in request. Keep setup pending; do not launch login during automatic setup."),
+                       if kind == "trial" else "The saved account needs an explicit sign-in request: run " + cli("login") +
+                       " only when the person asks to sign in. Keep setup pending until then; automatic setup never launches it."),
                       "If recovery is unavailable, keep setup pending. Never delete saved state or create a replacement trial."])
 
     def forget_connection(self):
@@ -918,8 +1002,7 @@ class Client:
     def connect(self, client_name=None):
         """Reuse or recover one identity. Only demonstrably fresh state may create a trial."""
         if self.identity.get("login_requested") or self.identity.get("trial_sign_in") or self.identity.get("connection_paused"):
-            raise ClientError("connection_pending", "A requested sign-in or logout needs an explicit next step; no trial was created.",
-                              guidance=["Keep setup pending until the person explicitly requests sign-in or trial access; do not launch login automatically."])
+            raise self.pending_connection()
         if self.tokens() is None and not self.api_key():
             if self.identity.get("connection_kind") == "account":
                 raise self.reconnect_required("account")
@@ -1054,7 +1137,15 @@ class Client:
         tokens = self.tokens()
         if tokens is None and not self.api_key():
             raise self.not_connected()
-        if tokens is None or tokens.get("kind") == "account":
+        if tokens is None:
+            # Only a named key is left. It is no saved sign-in (logout would refuse it,
+            # and a sign-in is not the alternative either), and there is no trial here
+            # to convert.
+            raise ClientError("named_key_active",
+                              "NEEDWING_API_KEY is set, so this connection is that key's account and not a trial; in-chat sign-up "
+                              "converts a trial account, so there is nothing to sign up. Nothing was sent.",
+                              guidance=["Run " + cli("account") + " to check that connection."])
+        if tokens.get("kind") == "account":
             raise ClientError("not_trial",
                               "The active token is an account sign-in; in-chat sign-up converts a trial account. Run logout first, or sign in instead.")
         shown = self.identity.get("terms_shown")
@@ -1147,13 +1238,31 @@ class Client:
             "The check is read-only and notifies only for new information. This offer has not scheduled a task.",
         ]
 
-    def login_output(self, scope, trial_closed=False):
+    def login_output(self, scope, trial_closed=False, account=None):
+        """What `login` reports. A device sign-in stores a new pair for the account the
+        person deliberately chose. A trial sign-in moves the same tokens, so its approval
+        is evidence of an account change and never the person's yes to that account: the
+        connection waits for their confirmation, which is reported here and shown by
+        `account`, and only --confirm-account on the next command installs it."""
         message = ("Signed in. The trial closed and its history stays with the trial. The existing connection moved to the approving account."
                    if trial_closed else "Signed in through the person's account.")
-        return {"status": "approved", "kind": "account", "scope": scope,
-                "reply_polling": {"status": "pending_account_check", "interval_seconds": 3600,
-                                  "requires_confirmation": True, "read_only": True},
-                "guidance": [message, "Run " + cli("account") + " to verify the account."] + self.reply_check_guidance()}
+        guidance = [message]
+        output = {"status": "approved", "kind": "account", "scope": scope,
+                  "reply_polling": {"status": "pending_account_check", "interval_seconds": 3600,
+                                    "requires_confirmation": True, "read_only": True}}
+        if trial_closed:
+            account = account if isinstance(account, dict) else {}
+            output["account_confirmation"] = "pending"
+            output["account"] = {name: account[name] for name in ("account_id", "level", "email") if name in account}
+            guidance += [
+                "The move waits for the person's yes: nothing is sent and no results are fetched until they confirm this account.",
+                "Tell the person which account approved (its email and level are shown), ask whether to keep using this connection under it, and only on their yes continue with " +
+                self.confirm_account_command() + " naming its account id. " + cli("account") + " shows it again.",
+            ]
+        else:
+            guidance.append("Run " + cli("account") + " to verify the account.")
+        output["guidance"] = guidance + self.reply_check_guidance()
+        return output
 
     def show_approval(self, user_code, complete_url, expires_in):
         verification_uri = self.base + "/activate"
@@ -1215,8 +1324,19 @@ class Client:
             account_id = self.confirmed_identity(account)
             trial_id = pending["account_id"]
             if account["level"] != "trial" and account_id.lower() != trial_id.lower():
-                self.identity["account_id"] = account_id
-                self.identity.pop("account_change_pending", None)
+                # The approval closed the trial and moved these same tokens to the approving
+                # account. The read above recorded that move as any read would (pending,
+                # `from` the trial's id) and kept the confirmed id: it is evidence of the
+                # move, never the person's yes to the account now in use, so the pending
+                # confirmation stands and only --confirm-account installs the new binding.
+                # What ends here is the wait for the approval: its markers go in this same
+                # write, so nothing re-checks a finished sign-in and a later `connect` is
+                # not held at connection_pending.
+                if not isinstance(self.identity.get("account_change_pending"), dict):
+                    # A directory that kept no id for the trial: the read had nothing to
+                    # keep, so the move is recorded from the id the sign-in started for.
+                    self.identity["account_change_pending"] = {"from": trial_id, "to": account_id}
+                    self.identity.pop("account_id", None)
                 self.identity.pop("trial_sign_in", None)
                 self.identity.pop("login_requested", None)
                 # The server caps the moved credential to these two scopes.
@@ -1224,7 +1344,7 @@ class Client:
                 scope = " ".join(part for part in tokens.get("scope", "").split() if part in {"research", "engage"})
                 tokens["scope"] = scope
                 write_private(self.identity_path, self.identity)
-                return self.login_output(scope, trial_closed=True)
+                return self.login_output(scope, trial_closed=True, account=account)
             if account["level"] != "trial" or account_id.lower() != trial_id.lower():
                 self.identity.pop("trial_sign_in", None)
                 self.identity.pop("login_requested", None)
@@ -1248,8 +1368,12 @@ class Client:
                 raise ClientError("invalid_scope", "A trial sign-in moves the existing grant. Use login without --scope.")
             return self.login_from_trial(pending)
         if active is not None and active.get("kind") == "account" and int(active.get("expires_at") or 0) > time.time():
+            # After a trial sign-in the move may still wait for the person's yes: say so,
+            # or a rerun of login would read as an all-clear.
+            pending = self.pending_move_guidance()
             raise ClientError("already_signed_in",
-                              "This state directory is already signed in. Run " + cli("account") + " for level and limits, or logout first.")
+                              "This state directory is already signed in. Run " + cli("account") + " for level and limits, or logout first.",
+                              **({"guidance": pending} if pending else {}))
         form = {"client_id": OAUTH_CLIENT, "resource": self.base + "/mcp"}
         if scope is not None and not SCOPE_PATTERN.fullmatch(scope):
             raise ClientError("invalid_scope", "Use space-separated scopes of letters, digits, : _ or spaces.")
@@ -1588,6 +1712,9 @@ class Client:
             raise ClientError("invalid_card", "reply_window_seconds is 60..86400.")
         if card.get("visibility") not in ("network", "private"):
             raise ClientError("invalid_card", 'visibility is "network" (listed) or "private" (owner-only listing).')
+        # Optional, and a boolean whenever it is present: Needwing refuses null, a string or a number here.
+        if "accept_trial_contacts" in card and not isinstance(card["accept_trial_contacts"], bool):
+            raise ClientError("invalid_card", "accept_trial_contacts is true or false (leave it out for the default).")
         channel = card.get("channel")
         if channel not in ("mcp", "a2a"):
             raise ClientError("invalid_card", 'channel is "mcp" (Needwing mailbox) or "a2a" (the Agent\'s own endpoint).')
@@ -2148,8 +2275,24 @@ class Client:
                     "This connection is on account " + current + " right now; the confirmation named another id.",
                     "Repeat with " + self.confirm_account_command() + " naming that account, or keep the connection waiting.",
                 ])
-        if isinstance(self.identity.get("account_change_pending"), dict):
-            self.identity.pop("account_change_pending", None)
+        self.identity.pop("account_change_pending", None)
+        # A trial sign-in's wait ends with the confirmation of its own move, and with
+        # nothing else. `login` records that wait before it sends, and a trial sign-in
+        # keeps its approval until the outcome is known. When that command stops first
+        # (a host timeout during the approval) and the person approves afterwards, the
+        # tokens move anyway: this confirmation is the explicit next step for it, and
+        # without it the two markers would outlive the move they belong to and hold
+        # every later `connect` at connection_pending. The move is confirmed only when
+        # the account confirmed now is another than the trial the sign-in started for.
+        # While the person is still approving, the connection is that trial: a
+        # confirmation naming it is a yes to the binding already in place and leaves the
+        # saved approval alone (a deleted one made the next `login` start a second
+        # sign-in, replacing the code the person is about to approve).
+        sign_in = self.identity.get("trial_sign_in")
+        started_for = sign_in.get("account_id") if isinstance(sign_in, dict) else None
+        if isinstance(started_for, str) and started_for.lower() != current.lower():
+            self.identity.pop("trial_sign_in", None)
+            self.identity.pop("login_requested", None)
         self.identity["account_id"] = current
         write_private(self.identity_path, self.identity)
         return current

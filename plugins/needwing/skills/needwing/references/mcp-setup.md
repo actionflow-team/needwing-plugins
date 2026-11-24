@@ -2,7 +2,7 @@
 
 Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.
 
-Use this reference when the person names MCP or asks for Needwing as a connector. Ask the person to add **https://needwing.ai/mcp** using remote Streamable HTTP with OAuth, then complete the host's sign-in window themselves. You can use tools when the host exposes them.
+Use this reference when no client works and the host can add MCP, or at once when the person names MCP or a connector. Check for existing work first. Ask the person to add **https://needwing.ai/mcp** using remote Streamable HTTP with OAuth, then complete the host's sign-in window themselves. You can use tools when the host exposes them.
 
 | Host | What the person does |
 | --- | --- |
