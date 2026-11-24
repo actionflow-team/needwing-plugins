@@ -2060,6 +2060,45 @@ class Client:
                 found.append((candidate.name, value))
         return found
 
+    @staticmethod
+    def merge_legacy_sends(record, legacies):
+        """Fence, content-free, every message an earlier client (2.1.0) sent in these files: a hash of its text. Each file is tracked by
+        the identity of its last send (`legacy_sources`: file name -> digest of its client_message_id), so a send already fenced, or lifted
+        by a deliberate resend, is never fenced again, while a send an earlier client makes later (it can keep writing the same
+        directory) is. Returns whether the record changed."""
+        sources = dict(record.get("legacy_sources", {}))
+        hashes, unreadable = set(record.get("legacy_send_sha256", [])), bool(record.get("legacy_send_any"))
+        changed = False
+        for name, legacy in legacies:
+            pending = legacy.get("last_send")
+            body = pending.get("body") if isinstance(pending, dict) else None
+            message_id = body.get("client_message_id") if isinstance(body, dict) else None
+            identity = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:24] if isinstance(message_id, str) else ""
+            if sources.get(name) == identity:
+                continue
+            sources[name] = identity
+            changed = True
+            if not isinstance(pending, dict):
+                continue
+            try:
+                hashes.add(hashlib.sha256(body["parts"][0]["text"].encode("utf-8")).hexdigest())
+            except (KeyError, IndexError, TypeError, AttributeError):
+                unreadable = True
+        if changed:
+            record["legacy_sources"] = sources
+            if hashes:
+                record["legacy_send_sha256"] = sorted(hashes)
+            if unreadable:
+                record["legacy_send_any"] = True
+        return changed
+
+    def refresh_legacy_sends(self, path, record):
+        """Every time a conversation is resolved: an earlier client may have written its files since (a send, a receipt)."""
+        legacies = self.legacy_records(record["conversation_id"]) if isinstance(record.get("conversation_id"), str) else []
+        if legacies and self.merge_legacy_sends(record, legacies):
+            write_private(path, record)
+        return record
+
     def claim_legacy(self, legacies, account, side, unverified):
         """Open this account's record of a conversation an earlier client saved without an account. The earlier files are never touched.
         Only after the service showed the conversation to this account (initiator side for a contact: the earlier client only ever
@@ -2084,26 +2123,7 @@ class Client:
         if contacts and not contact_receipt_usable(record.get("receipt")):
             record["receipt"] = contacts[0]["receipt"]
             record["side"] = "initiator"
-        # Each earlier file is imported once: what the record consumed from it since (a fence lifted by --new-message) is never reinstated
-        # by a later index (a repeated contact, the earlier pointer).
-        imported = set(record.get("legacy_imported", []))
-        hashes, unreadable = set(record.get("legacy_send_sha256", [])), bool(record.get("legacy_send_any"))
-        for name, legacy in legacies:
-            if name in imported:
-                continue
-            imported.add(name)
-            pending = legacy.get("last_send")
-            if not isinstance(pending, dict):
-                continue
-            try:
-                hashes.add(hashlib.sha256(pending["body"]["parts"][0]["text"].encode("utf-8")).hexdigest())
-            except (KeyError, IndexError, TypeError, AttributeError):
-                unreadable = True
-        record["legacy_imported"] = sorted(imported)
-        if hashes:
-            record["legacy_send_sha256"] = sorted(hashes)
-        if unreadable:
-            record["legacy_send_any"] = True
+        self.merge_legacy_sends(record, legacies)
         write_private(path, record)
         return path, record
 
@@ -2246,6 +2266,7 @@ class Client:
         record = read_private(conversation) if conversation.exists() else None
         if record is None or not contact_receipt_usable(record.get("receipt")):
             raise ClientError("invalid_state", "The saved contact has no conversation record; nothing was sent.")
+        self.refresh_legacy_sends(conversation, record)
         return record["receipt"]
 
     def legacy_contact(self, path, account, capability_id, text):
@@ -2321,7 +2342,8 @@ class Client:
             conversation_id = self.identifier(conversation_id, "conversation_id")
         path = self.conversation_path(account, conversation_id)
         if path.exists():
-            return self.record_of(path, read_private(path), conversation_id)
+            record = self.refresh_legacy_sends(path, read_private(path))
+            return self.record_of(path, record, conversation_id)
         legacies = self.legacy_records(conversation_id)
         if legacies:
             path, record = self.claim_legacy(legacies, account, side, unverified)
