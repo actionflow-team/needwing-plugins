@@ -2010,9 +2010,9 @@ class Client:
         write_private(self.state / "discovery.json", result)
         return result
 
-    def pennets(self, view="search", query=None, pennet_id=None, kind=None, category=None, sort=None, day=None,
+    def pennets(self, view="search", query=None, pennet_id=None, publisher=None, sort=None, day=None,
                 lang=None, cursor=None, limit=None, confirm_account=None):
-        """Search, list or read public pennets (stored public texts, links and AI News stories); no model, no ledger."""
+        """Search, list or read public pennets (short public Markdown texts, including the daily AI News report); no model, no ledger."""
         self.resolve_account_change(confirm_account)
         if view == "get":
             if not pennet_id:
@@ -2022,7 +2022,9 @@ class Client:
             return self.authorized("GET", "/v4/pennets/" + pennet_id)
         if view == "search" and not query:
             raise ClientError("query_required", "Pass --query to search pennets, or use --view list.")
-        params = {"view": view, "q": query, "kind": kind, "category": category, "sort": sort, "day": day, "lang": lang,
+        if publisher is not None and not re.fullmatch(r"pub_[A-Za-z0-9]{1,64}", publisher):
+            raise ClientError("invalid_identifier", "Use an actual publisher public_id (pub_...) returned by Needwing.")
+        params = {"view": view, "q": query, "publisher": publisher, "sort": sort, "day": day, "lang": lang,
                   "cursor": cursor, "limit": limit}
         return self.authorized("GET", "/v4/pennets?" + parse.urlencode({k: v for k, v in params.items() if v not in (None, "")}))
 
@@ -3467,12 +3469,11 @@ def main(argv=None):
     discover = commands.add_parser("discover", help="Read published supplies without contacting them")
     discover.add_argument("--request-file", required=True, help="UTF-8 natural request")
     confirm_option(discover)
-    pennets = commands.add_parser("pennets", help="Search, list or read public pennets (texts, links and AI News stories); trials included")
+    pennets = commands.add_parser("pennets", help="Search, list or read public pennets (short texts, including the daily AI News report); trials included")
     pennets.add_argument("--view", choices=["search", "list", "get"], default="search")
     pennets.add_argument("--query", help="Search words (view search)")
     pennets.add_argument("--pennet-id", help="One pennet to read (view get)")
-    pennets.add_argument("--kind", choices=["text", "link", "story"], help="story = AI News stories")
-    pennets.add_argument("--category", choices=["models", "products", "papers", "open_source", "policy", "daily"])
+    pennets.add_argument("--publisher", help="Only this publisher's pennets (pub_... public_id)")
     pennets.add_argument("--sort", choices=["latest", "hot"])
     pennets.add_argument("--day", help="YYYY-MM-DD")
     pennets.add_argument("--lang")
@@ -3571,7 +3572,7 @@ def main(argv=None):
             elif args.command == "discover":
                 result = client.discover(Path(args.request_file).read_text(encoding="utf-8"), args.confirm_account)
             elif args.command == "pennets":
-                result = client.pennets(args.view, args.query, args.pennet_id, args.kind, args.category, args.sort, args.day,
+                result = client.pennets(args.view, args.query, args.pennet_id, args.publisher, args.sort, args.day,
                                         args.lang, args.cursor, args.limit, args.confirm_account)
             elif args.command == "web-search":
                 result = client.web_search(args.query, args.limit, args.new_call, args.confirm_account)
