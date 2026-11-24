@@ -2103,6 +2103,18 @@ class Client:
         write_private(self.pointer_ambiguous_path, {"reason": "an earlier default pointer could not be kept apart",
                                                     "seq": max(time.time_ns(), latest + 1)})
 
+    def pointer_ambiguous(self, account):
+        """Whether the account's default is blocked by the ambiguity marker right now: a marker exists and the account's pointer is
+        missing, unreadable or not later than it. A settled default (later than the marker), an uncertain contact's included, is not."""
+        marker = self.marker_sequence()
+        if marker is None:
+            return False
+        try:
+            sequence = read_private(self.pointer_path(account)).get("seq")
+        except (ClientError, OSError, ValueError, AttributeError):
+            return True
+        return not (isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > marker)
+
     def ambiguous_default(self):
         return ClientError(
             "conversation_uncertain",
@@ -2533,7 +2545,6 @@ class Client:
             "legacy_conversation_unverified",
             "A conversation saved by an earlier client version cannot be shown to be this account's, so it was not used.",
             guidance=["Use contact with a capability returned by discovery, or sign in as the account that started it."])
-        named = conversation_id is not None
         if conversation_id is None:
             pointer_path = self.pointer_path(account)
             if pointer_path.exists():
@@ -2574,8 +2585,6 @@ class Client:
         path = self.conversation_path(account, conversation_id)
         if path.exists():
             record = self.canonical_record(path, account, conversation_id)
-            if named and self.marker_sequence() is not None:
-                self.write_pointer(account, {"conversation_id": conversation_id})  # naming it is the choice the ambiguity asked for
             return path, self.refresh_legacy_sends(path, record)
         legacies = self.legacy_records(conversation_id)
         if legacies:
@@ -2585,8 +2594,6 @@ class Client:
             self.visible_to_account(conversation_id, None, side)
             record = {"account_id": account, "conversation_id": conversation_id, "side": side, "receipt": {"conversation_id": conversation_id}}
             write_private(path, record)
-        if named and self.marker_sequence() is not None:
-            self.write_pointer(account, {"conversation_id": conversation_id})
         return self.record_of(path, record, conversation_id)
 
     def send(self, text, conversation_id=None, new_message=False, confirm_account=None):
@@ -2632,6 +2639,10 @@ class Client:
                 raise uncertain_write("invalid_receipt", "The message answer carried no sequence and delivery state; the message stays pending under its own id.")
             pending["receipt"] = receipt
             write_private(path, record)
+        account = record.get("account_id")
+        if conversation_id is not None and isinstance(account, str) and self.pointer_ambiguous(account):
+            # Only a message sent to a named conversation is the choice the ambiguity asked for; reading, closing or blocking is not.
+            self.write_pointer(account, {"conversation_id": target})
         return pending["receipt"]
 
     def conversation(self, conversation_id=None, wait_seconds=0, confirm_account=None):
