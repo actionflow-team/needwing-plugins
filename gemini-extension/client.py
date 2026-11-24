@@ -2004,11 +2004,6 @@ class Client:
             account = self.confirmed_identity(self.account())
             if isinstance(self.identity.get("account_change_pending"), dict):
                 raise self.account_changed_error()
-        if "legacy_owner" not in self.identity:
-            # State saved before conversations named an account (client 2.1.0 and earlier) is owned by the account this directory
-            # acted for when this client first handled a conversation: the only evidence that it never changed in between.
-            self.identity["legacy_owner"] = account.lower()
-            write_private(self.identity_path, self.identity)
         return account.lower()
 
     @staticmethod
@@ -2018,17 +2013,63 @@ class Client:
         owner = record.get("account_id") if isinstance(record, dict) else None
         return owner.lower() if isinstance(owner, str) else None
 
-    def visible_to_account(self, conversation_id, unowned_error):
-        """Ownership evidence for local state that names no account: a read of that conversation by the account acting now.
-        A refusal (403/404) means the account cannot be shown to own it and `unowned_error` surfaces; nothing else is sent."""
+    def visible_to_account(self, conversation_id, unowned_error, side=None):
+        """Evidence for local state that names no account: a read of that conversation by the account acting now, on the side the
+        state belongs to when it is known (`side`; a credential that acts on both sides must name one). A refusal (403/404) means the
+        account cannot be shown to own it and `unowned_error` surfaces; nothing is written by this read."""
+        endpoint = "/v4/conversations/" + conversation_id
+        if side:
+            endpoint += "?" + parse.urlencode({"side": side})
         try:
-            detail = self.authorized("GET", "/v4/conversations/" + conversation_id)
+            detail = self.authorized("GET", endpoint)
         except ClientError as exc:
-            if exc.payload.get("http_status") in (403, 404):
+            if unowned_error is not None and exc.payload.get("http_status") in (403, 404):
                 raise unowned_error from None
             raise
         if not isinstance(detail, dict):
-            raise unowned_error
+            raise unowned_error or ClientError("invalid_response", "The conversation read was not a conversation; nothing was saved.")
+
+    def pointer_path(self, account):
+        """The last-conversation pointer of one account. The pointer of an earlier client (`last-conversation.json`) is only read."""
+        return self.state / ("last-conversation-" + account + ".json")
+
+    def account_record_path(self, account, body):
+        """Where an account's contact record lives: a fingerprint of the account, the capability and the text."""
+        try:
+            parts = body["first_message"]["parts"]
+            text = parts[0]["text"]
+            capability_id = body["capability_id"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if len(parts) != 1 or not isinstance(text, str) or not isinstance(capability_id, str):
+            return None
+        return self.conversations / (hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest() + ".json")
+
+    def claim_legacy(self, legacy, account, side, unverified):
+        """Use state an earlier client (2.1.0) saved without an account. The earlier file is never touched. A delivered contact is
+        copied whole (body, receipt, pending follow-up, cursor, saved entries) into this account's own record, but only after the
+        service showed the conversation to this account (on the initiator side for a contact: the earlier client only ever started
+        contacts); the account's own record, when there is one, wins. Returns (path, record)."""
+        receipt = legacy.get("receipt") if isinstance(legacy, dict) else None
+        conversation_id = receipt.get("conversation_id") if isinstance(receipt, dict) else None
+        body = legacy.get("body") if isinstance(legacy, dict) else None
+        contact = isinstance(body, dict)
+        if not uuid_text(conversation_id) or (contact and not contact_receipt_usable(receipt)):
+            raise unverified
+        path = self.account_record_path(account, body) if contact else self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
+        if path is None:
+            raise unverified
+        if path.exists():
+            return path, read_private(path)
+        self.visible_to_account(conversation_id, unverified, "initiator" if contact else side)
+        record = json.loads(json.dumps(legacy))
+        record["account_id"] = account
+        pending = record.get("last_send")
+        if isinstance(pending, dict) and not (isinstance(pending.get("receipt"), dict) and message_receipt_usable(pending["receipt"])):
+            # A follow-up of the earlier client whose answer is unknown: it may have been delivered, so it is never sent again on its own.
+            pending["legacy_unconfirmed"] = True
+        write_private(path, record)
+        return path, record
 
     def connection_id(self):
         """What the service scopes a tool call's replay to besides the account: the grant behind this connection. A named key is
@@ -2124,8 +2165,8 @@ class Client:
         fingerprint = hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
         path = self.conversations / (fingerprint + ".json")
         record = read_private(path) if path.exists() else None
-        if record is None:
-            record = self.adopt_legacy_contact(path, account, capability_id, text, new_conversation)
+        if record is None and not new_conversation:
+            record = self.legacy_contact(path, account, capability_id, text)
         if record is not None and new_conversation:
             if "receipt" not in record:
                 raise ClientError("conversation_uncertain", "Resume the original contact before starting another identical conversation.")
@@ -2139,7 +2180,7 @@ class Client:
                                "first_message": {"client_message_id": "needwing-" + str(uuid.uuid4()),
                                                  "parts": [{"kind": "text", "text": text}]}}}
             write_private(path, record)
-        write_private(self.last_conversation_path, {"record": path.name, "account_id": account})
+        write_private(self.pointer_path(account), {"record": path.name, "account_id": account})
         if "receipt" in record and not contact_receipt_usable(record["receipt"]):
             # State written by an earlier client may hold a receipt that was never one: the contact is unconfirmed, so it is replayed with its own ids.
             record.pop("receipt", None)
@@ -2152,57 +2193,43 @@ class Client:
             write_private(path, record)
         return record["receipt"]
 
-    def adopt_legacy_contact(self, path, account, capability_id, text, new_conversation):
-        """A contact saved by an earlier client (2.1.0 and before) lives under a fingerprint of capability and text alone and names
-        no account. Retrying that command keeps its original ids, so a lost answer replays idempotently and a saved receipt is
-        returned instead of a second first message. It is claimed for the account acting now only on evidence: a receipt must be
-        readable by this account, a receiptless contact must date from the account this directory belonged to when this client
-        first ran. Otherwise nothing is sent. Returns the claimed record (written at `path`), or None when there is no legacy
-        contact to claim."""
-        fingerprint = hashlib.sha256(json.dumps([capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
-        legacy_path = self.conversations / (fingerprint + ".json")
+    def legacy_contact(self, path, account, capability_id, text):
+        """The contact an earlier client (2.1.0) saved for this capability and text lives under a fingerprint without an account and is
+        never moved or changed. A delivered one is claimed for this account once the service shows the conversation to it (its receipt
+        and everything saved with it are copied to `path`); one whose answer never came is never sent by this client: it may have been
+        delivered, nothing says whose it is, and a replay under another account would be a second first message. Returns the claimed
+        record, or None when there is no earlier contact."""
+        legacy_path = self.conversations / (hashlib.sha256(json.dumps([capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest() + ".json")
         if not legacy_path.exists():
             return None
         legacy = read_private(legacy_path)
         body = legacy.get("body") if isinstance(legacy, dict) else None
         if (self.record_owner(legacy) is not None or not isinstance(body, dict) or body.get("capability_id") != capability_id or
-                not isinstance(body.get("client_conversation_id"), str) or not isinstance(body.get("first_message"), dict)):
-            return None
-        receipt = legacy.get("receipt")
-        delivered = contact_receipt_usable(receipt)
-        owned_by_directory = self.identity.get("legacy_owner") == account
-        if new_conversation:
-            if not delivered and owned_by_directory:
-                raise ClientError("conversation_uncertain", "Resume the original contact before starting another identical conversation.")
-            # An explicit new contact: the earlier one stays on record under its own id and no longer stands in the way.
-            write_private(self.conversations / (body["client_conversation_id"] + ".json"), legacy)
-            legacy_path.unlink()
+                not isinstance(body.get("first_message"), dict)):
             return None
         unverified = ClientError(
             "legacy_contact_unverified",
-            "A contact saved by an earlier client version cannot be shown to belong to this account, so it was neither returned nor sent again.",
-            guidance=["If the person started it, sign in as that account and repeat the same command; its original ids are kept.",
-                      "To start a new contact for this account instead, repeat the command with --new-conversation."])
-        if delivered:
-            self.visible_to_account(receipt["conversation_id"], unverified)
-        elif not owned_by_directory:
+            "A contact saved by an earlier client version cannot be shown to be this account's, so it was neither returned nor sent again.",
+            guidance=["If its answer never came, it may still have been delivered: look for it in this account's conversations (GET /v4/conversations), or sign in as the account that started it and repeat the command.",
+                      "To send a new contact deliberately (it may duplicate the earlier one), repeat the command with --new-conversation. The earlier contact stays saved."])
+        if not contact_receipt_usable(legacy.get("receipt")):
             raise unverified
-        record = {"account_id": account, "body": body}
-        if delivered:
-            record["receipt"] = receipt
-        write_private(path, record)
-        legacy_path.unlink()
-        return record
+        return self.claim_legacy(legacy, account, "initiator", unverified)[1]
 
-    def conversation_record(self, conversation_id=None):
+    def conversation_record(self, conversation_id=None, side=None):
+        """The saved record this account resumes: by explicit id or by its last-conversation pointer. State of an earlier client (no
+        account) is never changed; it is copied into this account's own record once the service shows the conversation to the account
+        (`side` names the side the person chose, which a credential acting on both sides needs)."""
         account = self.active_account()
-        other_account = ClientError("no_conversation", "The saved conversation belongs to another account than this connection; it is not used.",
-                                    guidance=["Use contact with a capability returned by discovery, or sign in as the account that started it."])
+        unverified = ClientError(
+            "legacy_conversation_unverified",
+            "A conversation saved by an earlier client version cannot be shown to be this account's, so it was not used.",
+            guidance=["Use contact with a capability returned by discovery, or sign in as the account that started it."])
         if conversation_id is not None:
             conversation_id = self.identifier(conversation_id, "conversation_id")
             # A known conversation can be resumed on another invocation without creating a replacement. Local state is
             # indexed by account and id: another account's record of the same id is not this account's and never blocks it.
-            unowned = []
+            earlier = []
             for candidate in sorted(self.conversations.glob("*.json")):
                 value = read_private(candidate)
                 receipt = value.get("receipt") if isinstance(value, dict) else None
@@ -2212,41 +2239,43 @@ class Client:
                 if owner == account:
                     return candidate, value
                 if owner is None:
-                    unowned.append((candidate, value))
-            if unowned:
-                candidate, value = unowned[0]
-                self.visible_to_account(conversation_id, other_account)
-                value["account_id"] = account
-                write_private(candidate, value)
-                return candidate, value
+                    earlier.append(value)
+            if earlier:
+                return self.claim_legacy(earlier[0], account, side, unverified)
             # Nothing is saved for this account before Needwing showed the conversation to it.
-            self.authorized("GET", "/v4/conversations/" + conversation_id)
+            self.visible_to_account(conversation_id, None, side)
             path = self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
             record = {"account_id": account, "receipt": {"conversation_id": conversation_id}}
             write_private(path, record)
             return path, record
-        if not self.last_conversation_path.exists():
+        pointer_path = self.pointer_path(account)
+        if pointer_path.exists():
+            pointer = read_private(pointer_path)
+            filename = pointer.get("record", "")
+            if not isinstance(filename, str) or not re.fullmatch(r"[a-f0-9]{64}\.json", filename):
+                raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
+            path = self.conversations / filename
+            record = read_private(path)
+            if self.record_owner(record) != account:
+                raise ClientError("invalid_state", "The saved conversation pointer names a record of another account.")
+        elif self.last_conversation_path.exists():
+            # The pointer of an earlier client: read, never rewritten. Its record is claimed by the same evidence.
+            pointer = read_private(self.last_conversation_path)
+            filename = pointer.get("record", "")
+            if not isinstance(filename, str) or not re.fullmatch(r"[a-f0-9]{64}\.json", filename):
+                raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
+            earlier = read_private(self.conversations / filename)
+            if self.record_owner(earlier) is not None:
+                raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
+            if "receipt" not in earlier:
+                raise ClientError("conversation_uncertain", "The earlier client's contact has no recorded answer and is not sent again; see the contact command's guidance.",
+                                  guidance=["Its answer may have been lost after delivery: look for it in this account's conversations (GET /v4/conversations), or repeat the contact command with --new-conversation to send a new one deliberately."])
+            path, record = self.claim_legacy(earlier, account, side, unverified)
+            write_private(pointer_path, {"record": path.name, "account_id": account})
+        else:
             raise ClientError("no_conversation", "No saved conversation; use contact with a capability returned by discovery.")
-        pointer = read_private(self.last_conversation_path)
-        filename = pointer.get("record", "")
-        if not re.fullmatch(r"[a-f0-9]{64}\.json", filename):
-            raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
-        pointer_owner = self.record_owner(pointer)
-        if pointer_owner is not None and pointer_owner != account:
-            raise other_account
-        path = self.conversations / filename
-        record = read_private(path)
-        record_owner = self.record_owner(record)
-        if record_owner is not None and record_owner != account:
-            raise other_account
         if "receipt" not in record:
             raise ClientError("conversation_uncertain", "Repeat the original contact command; keep the saved request and identity.")
-        if pointer_owner is None or record_owner is None:
-            # Saved by an earlier client without an account: used only once this account is shown to see that conversation.
-            self.visible_to_account(self.identifier(record["receipt"].get("conversation_id"), "conversation_id"), other_account)
-            record["account_id"] = account
-            write_private(path, record)
-            write_private(self.last_conversation_path, {"record": filename, "account_id": account})
         return path, record
 
     def send(self, text, conversation_id=None, new_message=False, confirm_account=None):
@@ -2260,6 +2289,16 @@ class Client:
             # about replacing the record: the original message id stays and --new-message cannot discard it.
             pending.pop("receipt", None)
             write_private(path, record)
+        if pending and "receipt" not in pending and pending.get("legacy_unconfirmed") is True:
+            if not new_message:
+                raise ClientError(
+                    "legacy_message_unverified",
+                    "A follow-up saved by an earlier client version has no recorded answer: it may already have been delivered, so it is not sent again automatically.",
+                    guidance=["Read the conversation to see whether it arrived.",
+                              "To send this message deliberately (it may duplicate the earlier one), repeat the command with --new-message."])
+            record.pop("last_send")
+            write_private(path, record)
+            pending = None
         if pending and "receipt" not in pending:
             if pending["body"]["parts"] != [{"kind": "text", "text": text}] or new_message:
                 raise ClientError("message_uncertain", "Reconcile the previous message with its original text before sending a new one.")
@@ -2380,7 +2419,7 @@ class Client:
         if side is not None and side not in {"initiator", "provider"}:
             raise ClientError("invalid_side", "Use initiator or provider.")
         self.resolve_account_change(confirm_account)
-        path, record = self.conversation_record(conversation_id)
+        path, record = self.conversation_record(conversation_id, side)
         target = self.identifier(record["receipt"]["conversation_id"], "conversation_id")
         result = self.authorized("POST", "/v4/conversations/" + target + "/block", {"side": side} if side else {})
         if result.get("blocked") is not True:
