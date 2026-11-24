@@ -550,7 +550,8 @@ class Client:
             found.append(request_id)
         return found
 
-    def save_tokens(self, pair, kind):
+    def save_tokens(self, pair, kind, same_grant=False):
+        """Keep a new pair. A new sign-in is a new grant (a new local connection id); a refresh keeps the grant it renews."""
         if not isinstance(pair, dict) or not isinstance(pair.get("access_token"), str) or not pair["access_token"]:
             raise ClientError("invalid_response", "The token response carried no access token; saved state was retained.")
         try:
@@ -567,6 +568,8 @@ class Client:
             "kind": kind,
         }
         self.identity["tokens"] = tokens
+        if not (same_grant and isinstance(self.identity.get("connection_id"), str) and self.identity["connection_id"]):
+            self.identity["connection_id"] = "grant-" + uuid.uuid4().hex
         self.identity["connection_kind"] = kind
         self.identity.pop("login_requested", None)
         self.identity.pop("connection_paused", None)
@@ -938,7 +941,7 @@ class Client:
         if not isinstance(result.get("access_token"), str) or not result.get("access_token"):
             raise ClientError("invalid_response",
                               "The token response was incomplete. The refresh is treated as used: the next command recovers or asks to reconnect.")
-        return self.save_tokens(result, kind)
+        return self.save_tokens(result, kind, same_grant=True)
 
     # ---- guidance ----------------------------------------------------------
 
@@ -2001,39 +2004,81 @@ class Client:
             account = self.confirmed_identity(self.account())
             if isinstance(self.identity.get("account_change_pending"), dict):
                 raise self.account_changed_error()
+        if "legacy_owner" not in self.identity:
+            # State saved before conversations named an account (client 2.1.0 and earlier) is owned by the account this directory
+            # acted for when this client first handled a conversation: the only evidence that it never changed in between.
+            self.identity["legacy_owner"] = account.lower()
+            write_private(self.identity_path, self.identity)
         return account.lower()
 
     @staticmethod
-    def record_belongs_to(record, account):
-        """A saved conversation record or pointer of another account is never reused. An entry written without an account
-        (state older than this binding) names none, so it cannot be told apart and is read as before."""
+    def record_owner(record):
+        """The account a saved conversation record or pointer names (lower case), or None for one written without an
+        account (state older than this binding)."""
         owner = record.get("account_id") if isinstance(record, dict) else None
-        return not isinstance(owner, str) or owner.lower() == account
+        return owner.lower() if isinstance(owner, str) else None
+
+    def visible_to_account(self, conversation_id, unowned_error):
+        """Ownership evidence for local state that names no account: a read of that conversation by the account acting now.
+        A refusal (403/404) means the account cannot be shown to own it and `unowned_error` surfaces; nothing else is sent."""
+        try:
+            detail = self.authorized("GET", "/v4/conversations/" + conversation_id)
+        except ClientError as exc:
+            if exc.payload.get("http_status") in (403, 404):
+                raise unowned_error from None
+            raise
+        if not isinstance(detail, dict):
+            raise unowned_error
+
+    def connection_id(self):
+        """What the service scopes a tool call's replay to besides the account: the grant behind this connection. A named key is
+        told apart by a fingerprint of the key (never the key); a sign-in by the local id minted when its grant was created."""
+        key = self.api_key()
+        if key:
+            return "key-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+        if self.tokens() is None:
+            raise self.not_connected()
+        if not (isinstance(self.identity.get("connection_id"), str) and self.identity["connection_id"]):
+            self.identity["connection_id"] = "grant-" + uuid.uuid4().hex
+            write_private(self.identity_path, self.identity)
+        return self.identity["connection_id"]
 
     def tool_call(self, tool, tool_input, new_call=False, confirm_account=None):
         """One public tool call (POST /v4/tools/<tool>/calls, a bounded read-only call that never runs a Needwing model).
 
-        The call and its idempotency key are saved before it is sent, per account, tool and exact input: after a lost answer
-        the same command replays the saved key and recovers the stored result instead of calling again. The saved call is
-        dropped once Needwing's answer is in hand (a later identical command is a new call); an `unknown` answer keeps it,
-        because that call may have run and is never sent again unless the person asks with --new-call."""
+        The call and its idempotency key are saved before it is sent, per account, tool and exact input, together with the
+        connection (grant or named key) that sends it: Needwing replays a key only for the same account and grant, so after a
+        lost answer the same command on the same connection replays the saved key and recovers the stored result instead of
+        calling again, and on another connection it stops (a replay there would be a new call). The saved call is dropped once
+        Needwing's answer is in hand (a later identical command is a new call); an `unknown` answer keeps it, because that call
+        may have run and is never sent again unless the person asks with --new-call. A refusal of a later attempt does not prove
+        the first one failed, so the saved key survives it; only a definite refusal of the first attempt drops the key."""
         self.resolve_account_change(confirm_account)
         account = self.active_account()
+        connection = self.connection_id()
         fingerprint = hashlib.sha256(json.dumps([account, tool, tool_input], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         path = self.tools / (fingerprint + ".json")
         record = read_private(path) if path.exists() else None
-        if record is not None and new_call and record.get("answered") is True:
+        if record is not None and new_call and (record.get("answered") is True or record.get("connection") != connection):
             record = None
+        if record is not None and record.get("connection") != connection:
+            raise ClientError(
+                "tool_connection_changed",
+                "An earlier call of this tool may have run on another connection (another sign-in or key). Needwing replays a saved call only on the connection that sent it, so sending it here would be a new call. Nothing was sent.",
+                guidance=["To recover the earlier answer, reconnect with the original sign-in or key and repeat the same command.",
+                          "To run the call again on this connection, repeat the command with --new-call (only if the person wants it run again)."])
         if record is None:
-            record = {"account_id": account, "tool": tool,
+            record = {"account_id": account, "tool": tool, "connection": connection, "attempts": 0,
                       "body": {"input": tool_input, "idempotency_key": "needwing-" + str(uuid.uuid4())}}
-            write_private(path, record)
+        first_attempt = record.get("attempts", 0) == 0
+        record["attempts"] = record.get("attempts", 0) + 1
+        write_private(path, record)
         try:
             result = self.authorized("POST", "/v4/tools/" + tool + "/calls", record["body"])
         except ClientError as exc:
             status = exc.payload.get("http_status")
-            if isinstance(status, int) and 400 <= status < 500 and status != 409:
-                # A definite refusal: Needwing recorded nothing under the key, so there is nothing to recover.
+            if first_attempt and isinstance(status, int) and 400 <= status < 500 and status != 409:
+                # A definite refusal of the first attempt: Needwing recorded nothing under the key, so there is nothing to recover.
                 path.unlink(missing_ok=True)
             raise
         if not isinstance(result.get("call_id"), str) or result.get("tool") != tool or result.get("status") not in TOOL_STATUSES:
@@ -2079,6 +2124,8 @@ class Client:
         fingerprint = hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
         path = self.conversations / (fingerprint + ".json")
         record = read_private(path) if path.exists() else None
+        if record is None:
+            record = self.adopt_legacy_contact(path, account, capability_id, text, new_conversation)
         if record is not None and new_conversation:
             if "receipt" not in record:
                 raise ClientError("conversation_uncertain", "Resume the original contact before starting another identical conversation.")
@@ -2105,21 +2152,76 @@ class Client:
             write_private(path, record)
         return record["receipt"]
 
+    def adopt_legacy_contact(self, path, account, capability_id, text, new_conversation):
+        """A contact saved by an earlier client (2.1.0 and before) lives under a fingerprint of capability and text alone and names
+        no account. Retrying that command keeps its original ids, so a lost answer replays idempotently and a saved receipt is
+        returned instead of a second first message. It is claimed for the account acting now only on evidence: a receipt must be
+        readable by this account, a receiptless contact must date from the account this directory belonged to when this client
+        first ran. Otherwise nothing is sent. Returns the claimed record (written at `path`), or None when there is no legacy
+        contact to claim."""
+        fingerprint = hashlib.sha256(json.dumps([capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
+        legacy_path = self.conversations / (fingerprint + ".json")
+        if not legacy_path.exists():
+            return None
+        legacy = read_private(legacy_path)
+        body = legacy.get("body") if isinstance(legacy, dict) else None
+        if (self.record_owner(legacy) is not None or not isinstance(body, dict) or body.get("capability_id") != capability_id or
+                not isinstance(body.get("client_conversation_id"), str) or not isinstance(body.get("first_message"), dict)):
+            return None
+        receipt = legacy.get("receipt")
+        delivered = contact_receipt_usable(receipt)
+        owned_by_directory = self.identity.get("legacy_owner") == account
+        if new_conversation:
+            if not delivered and owned_by_directory:
+                raise ClientError("conversation_uncertain", "Resume the original contact before starting another identical conversation.")
+            # An explicit new contact: the earlier one stays on record under its own id and no longer stands in the way.
+            write_private(self.conversations / (body["client_conversation_id"] + ".json"), legacy)
+            legacy_path.unlink()
+            return None
+        unverified = ClientError(
+            "legacy_contact_unverified",
+            "A contact saved by an earlier client version cannot be shown to belong to this account, so it was neither returned nor sent again.",
+            guidance=["If the person started it, sign in as that account and repeat the same command; its original ids are kept.",
+                      "To start a new contact for this account instead, repeat the command with --new-conversation."])
+        if delivered:
+            self.visible_to_account(receipt["conversation_id"], unverified)
+        elif not owned_by_directory:
+            raise unverified
+        record = {"account_id": account, "body": body}
+        if delivered:
+            record["receipt"] = receipt
+        write_private(path, record)
+        legacy_path.unlink()
+        return record
+
     def conversation_record(self, conversation_id=None):
         account = self.active_account()
         other_account = ClientError("no_conversation", "The saved conversation belongs to another account than this connection; it is not used.",
                                     guidance=["Use contact with a capability returned by discovery, or sign in as the account that started it."])
         if conversation_id is not None:
             conversation_id = self.identifier(conversation_id, "conversation_id")
-            # A known conversation can be resumed on another invocation without
-            # creating a replacement. Server ownership checks remain authoritative.
-            path = self.conversations / (conversation_id + ".json")
-            for candidate in self.conversations.glob("*.json"):
+            # A known conversation can be resumed on another invocation without creating a replacement. Local state is
+            # indexed by account and id: another account's record of the same id is not this account's and never blocks it.
+            unowned = []
+            for candidate in sorted(self.conversations.glob("*.json")):
                 value = read_private(candidate)
-                if value.get("receipt", {}).get("conversation_id") == conversation_id:
-                    if not self.record_belongs_to(value, account):
-                        raise other_account
+                receipt = value.get("receipt") if isinstance(value, dict) else None
+                if not isinstance(receipt, dict) or receipt.get("conversation_id") != conversation_id:
+                    continue
+                owner = self.record_owner(value)
+                if owner == account:
                     return candidate, value
+                if owner is None:
+                    unowned.append((candidate, value))
+            if unowned:
+                candidate, value = unowned[0]
+                self.visible_to_account(conversation_id, other_account)
+                value["account_id"] = account
+                write_private(candidate, value)
+                return candidate, value
+            # Nothing is saved for this account before Needwing showed the conversation to it.
+            self.authorized("GET", "/v4/conversations/" + conversation_id)
+            path = self.conversations / ("by-id-" + account + "-" + conversation_id + ".json")
             record = {"account_id": account, "receipt": {"conversation_id": conversation_id}}
             write_private(path, record)
             return path, record
@@ -2129,14 +2231,22 @@ class Client:
         filename = pointer.get("record", "")
         if not re.fullmatch(r"[a-f0-9]{64}\.json", filename):
             raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
-        if not self.record_belongs_to(pointer, account):
+        pointer_owner = self.record_owner(pointer)
+        if pointer_owner is not None and pointer_owner != account:
             raise other_account
         path = self.conversations / filename
         record = read_private(path)
-        if not self.record_belongs_to(record, account):
+        record_owner = self.record_owner(record)
+        if record_owner is not None and record_owner != account:
             raise other_account
         if "receipt" not in record:
             raise ClientError("conversation_uncertain", "Repeat the original contact command; keep the saved request and identity.")
+        if pointer_owner is None or record_owner is None:
+            # Saved by an earlier client without an account: used only once this account is shown to see that conversation.
+            self.visible_to_account(self.identifier(record["receipt"].get("conversation_id"), "conversation_id"), other_account)
+            record["account_id"] = account
+            write_private(path, record)
+            write_private(self.last_conversation_path, {"record": filename, "account_id": account})
         return path, record
 
     def send(self, text, conversation_id=None, new_message=False, confirm_account=None):
