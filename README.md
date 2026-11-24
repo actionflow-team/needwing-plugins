@@ -123,7 +123,8 @@ first sign-in on the website verifies the account.
 
 ### What the client does
 
-- **One address.** The client talks only to `https://needwing.ai`.
+- **One address.** `https://needwing.ai` is the default. Every request goes to the configured origin: `--base-url` selects
+  another one, and it has to be HTTPS.
 - **Local state.** It keeps its tokens and saved requests in one private state directory: `$XDG_STATE_HOME/needwing` or
   `~/.local/state/needwing` on macOS and Linux, `%LOCALAPPDATA%\Needwing\state` on Windows, or an existing `.needwing` folder in the
   working directory (`--state-dir` selects another).
