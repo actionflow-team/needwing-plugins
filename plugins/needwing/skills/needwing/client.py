@@ -162,6 +162,19 @@ def contact_receipt_usable(receipt):
     return (isinstance(receipt, dict) and uuid_text(receipt.get("conversation_id"))
             and enum_value(receipt.get("state"), CONVERSATION_STATES)
             and message_receipt_usable(receipt.get("first_message")))
+
+
+def receipt_conversation(receipt):
+    """The conversation id a saved receipt names, in the one spelling (lower case) every record, pointer and path uses; None when there is none."""
+    value = receipt.get("conversation_id") if isinstance(receipt, dict) else None
+    return value.lower() if isinstance(value, str) else None
+
+
+def lowered_receipt(receipt):
+    """A usable contact receipt with its conversation id in lower case."""
+    return dict(receipt, conversation_id=receipt["conversation_id"].lower())
+
+
 # Provider registration routes (/v4/providers…) need the agent:register scope on the Agent's own token:
 # drafts register and test from the limited level; publishing needs a verified account.
 PROVIDER_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
@@ -550,8 +563,9 @@ class Client:
             found.append(request_id)
         return found
 
-    def save_tokens(self, pair, kind, same_grant=False):
-        """Keep a new pair. A new sign-in is a new grant (a new local connection id); a refresh keeps the grant it renews."""
+    def save_tokens(self, pair, kind, same_grant=False, bind_account=False):
+        """Keep a new pair. A new sign-in is a new grant (a new local connection id); a refresh keeps the grant it renews.
+        `bind_account` binds the cached account id to the grant this pair opens (see bind_account)."""
         if not isinstance(pair, dict) or not isinstance(pair.get("access_token"), str) or not pair["access_token"]:
             raise ClientError("invalid_response", "The token response carried no access token; saved state was retained.")
         try:
@@ -571,6 +585,8 @@ class Client:
         if not (same_grant and isinstance(self.identity.get("connection_id"), str) and self.identity["connection_id"]):
             self.identity["connection_id"] = "grant-" + uuid.uuid4().hex
         self.identity["connection_kind"] = kind
+        if bind_account and isinstance(self.identity.get("account_id"), str):
+            self.identity["account_connection"] = self.connection_id()
         self.identity.pop("login_requested", None)
         self.identity.pop("connection_paused", None)
         self.identity.pop("refresh_in_flight", None)  # one atomic write: new pair in, marker out
@@ -886,6 +902,9 @@ class Client:
         self.identity["connection_kind"] = self.identity.get("connection_kind") or (self.tokens() or {}).get("kind") or "unknown"
         self.identity.pop("tokens", None)
         self.identity.pop("refresh_in_flight", None)
+        # The cached account id stays (a later credential that reads as another account is a detected move), but the connection
+        # it was confirmed with is gone: no other credential may use it as its binding.
+        self.identity.pop("account_connection", None)
         if not self.request_id_recoverable():
             for key in ("request_id", "request_id_created_at", "trial_account_id"):
                 self.identity.pop(key, None)
@@ -1129,7 +1148,7 @@ class Client:
         # confirmed id. A pending move is never overwritten by the receipt.
         if not isinstance(self.identity.get("account_change_pending"), dict):
             self.identity["account_id"] = trial_id
-        self.save_tokens(result["token"], "trial")  # also writes the identity and clears any refresh marker
+        self.save_tokens(result["token"], "trial", bind_account=True)  # also writes the identity and clears any refresh marker
         return result
 
     def terms(self):
@@ -1258,7 +1277,7 @@ class Client:
             self.identity["connection_kind"] = "account"
             if isinstance(self.identity.get("tokens"), dict):
                 self.identity["tokens"]["kind"] = "account"
-            self.identity["account_id"] = account_id
+            self.bind_account(account_id)
             write_private(self.identity_path, self.identity)
         output, _ = self.with_next(result, [])
         output = {key: output[key] for key in ("account_id", "level", "email", "next") if key in output}
@@ -1383,6 +1402,7 @@ class Client:
                     # keep, so the move is recorded from the id the sign-in started for.
                     self.identity["account_change_pending"] = {"from": trial_id, "to": account_id}
                     self.identity.pop("account_id", None)
+                    self.identity.pop("account_connection", None)
                 self.identity.pop("trial_sign_in", None)
                 self.identity.pop("login_requested", None)
                 # The server caps the moved credential to these two scopes.
@@ -1468,6 +1488,7 @@ class Client:
             # bindings independently: a draft naming the old account still refuses
             # under the new sign-in instead of being silently rebound or resent.
             self.identity.pop("account_id", None)
+            self.identity.pop("account_connection", None)
             self.identity.pop("account_change_pending", None)
             self.identity.pop("trial_sign_in", None)
             self.save_tokens(result, "account")
@@ -1536,6 +1557,7 @@ class Client:
         # Without tokens the cached id is unproven; drop it so a later sign-in as anyone
         # is never treated as the account an unsent draft was bound to.
         self.identity.pop("account_id", None)
+        self.identity.pop("account_connection", None)
         write_private(self.identity_path, self.identity)
         guidance = ["Local tokens were forgotten." if had else "There were no local tokens."]
         if trial:
@@ -1602,8 +1624,9 @@ class Client:
                 # pending confirmation names the moved-to account, and promoting it here
                 # would let ungated reads use it as their precondition: only the person's
                 # confirmed yes (resolve_account_change) installs it.
-                if self.identity.get("account_id") != account_id:
-                    self.identity["account_id"] = account_id
+                connection = self.connection_id()
+                if self.identity.get("account_id") != account_id or self.identity.get("account_connection") != connection:
+                    self.bind_account(account_id)
                     changed = True
             if level in {"limited", "verified"}:
                 # A converted trial is now an account, even if the original token came
@@ -2056,7 +2079,7 @@ class Client:
         for candidate in sorted(self.conversations.glob("*.json")):
             value = read_private(candidate)
             receipt = value.get("receipt") if isinstance(value, dict) else None
-            if isinstance(receipt, dict) and receipt.get("conversation_id") == conversation_id and self.record_owner(value) is None:
+            if receipt_conversation(receipt) == conversation_id.lower() and self.record_owner(value) is None:
                 found.append((candidate.name, value))
         return found
 
@@ -2099,29 +2122,34 @@ class Client:
             write_private(path, record)
         return record
 
-    def claim_legacy(self, legacies, account, side, unverified):
+    def claim_legacy(self, legacies, account, conversation_id, side, unverified, as_contact):
         """Open this account's record of a conversation an earlier client saved without an account. The earlier files are never touched.
-        Only after the service showed the conversation to this account (initiator side for a contact: the earlier client only ever
-        started contacts) is anything written, and only what is needed to act: the id and receipt, the side, and a content-free fence
-        for every message the earlier client sent (a hash of its text, never the text). Its cursor, transcript and metadata are not
-        imported (they may belong to the other participant): the record starts at cursor zero and is rebuilt from what Needwing returns
-        to this account. Returns (path, record)."""
-        first = legacies[0][1]
-        receipt = first.get("receipt")
-        conversation_id = receipt.get("conversation_id") if isinstance(receipt, dict) else None
-        if not uuid_text(conversation_id):
-            raise unverified
-        contacts = [legacy for _, legacy in legacies if isinstance(legacy.get("body"), dict)]
-        if contacts and not contact_receipt_usable(contacts[0].get("receipt")):
-            raise unverified
+        Only after the service showed the conversation to this account is anything written, and only what is needed to act: the id,
+        the side, and a content-free fence for every message the earlier client sent (a hash of its text, never the text). Its cursor,
+        transcript and metadata are not imported (they may belong to the other participant): the record starts at cursor zero and is
+        rebuilt from what Needwing returns to this account.
+        An explicit conversation id (`as_contact` False) is shown on the side the caller names (a provider acts on a conversation an
+        initiator's earlier client saved in the same directory) and keeps a receipt that names only the id. Adopting the earlier client's
+        contact (`as_contact`: the repeated contact command, the earlier last-conversation pointer) needs its usable receipt and is
+        shown on the initiator side, the only side an earlier client ever started contacts on; the receipt is copied only after that
+        read, also when this account already holds a record of the conversation that opened without one. Returns (path, record)."""
+        conversation_id = conversation_id.lower()
+        contact = None
+        if as_contact:
+            contacts = [legacy for _, legacy in legacies if isinstance(legacy.get("body"), dict)]
+            if contacts:
+                if not contact_receipt_usable(contacts[0].get("receipt")):
+                    raise unverified
+                contact = lowered_receipt(contacts[0]["receipt"])
         path = self.conversation_path(account, conversation_id)
         record = read_private(path) if path.exists() else None
+        if record is None or (contact is not None and not contact_receipt_usable(record.get("receipt"))):
+            self.visible_to_account(conversation_id, unverified, "initiator" if contact is not None else side)
         if record is None:
-            self.visible_to_account(conversation_id, unverified, "initiator" if contacts else side)
-            record = {"account_id": account, "conversation_id": conversation_id, "side": "initiator" if contacts else side,
+            record = {"account_id": account, "conversation_id": conversation_id, "side": side,
                       "receipt": {"conversation_id": conversation_id}}
-        if contacts and not contact_receipt_usable(record.get("receipt")):
-            record["receipt"] = contacts[0]["receipt"]
+        if contact is not None and not contact_receipt_usable(record.get("receipt")):
+            record["receipt"] = contact
             record["side"] = "initiator"
         self.merge_legacy_sends(record, legacies)
         write_private(path, record)
@@ -2226,6 +2254,7 @@ class Client:
             # State written by an earlier client may hold a receipt: one that was never a receipt leaves the contact unconfirmed (replayed with its own ids).
             earlier = index.pop("receipt")
             if contact_receipt_usable(earlier):
+                earlier = lowered_receipt(earlier)
                 index["conversation_id"] = earlier["conversation_id"]
                 if not self.conversation_path(account, earlier["conversation_id"]).exists():
                     write_private(self.conversation_path(account, earlier["conversation_id"]),
@@ -2250,6 +2279,7 @@ class Client:
             result = self.authorized("POST", "/v4/conversations", index["body"])
             if not contact_receipt_usable(result):
                 raise uncertain_write("invalid_receipt", "The contact answer carried no usable conversation receipt; nothing was saved as sent.")
+            result = lowered_receipt(result)
             conversation = self.conversation_path(account, result["conversation_id"])
             if conversation.exists():
                 record = read_private(conversation)
@@ -2261,8 +2291,9 @@ class Client:
             write_private(path, {"account_id": account, "conversation_id": result["conversation_id"]})
             write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": result["conversation_id"]})
             return result
-        write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": index["conversation_id"]})
-        conversation = self.conversation_path(account, index["conversation_id"])
+        saved_id = index["conversation_id"].lower() if isinstance(index["conversation_id"], str) else index["conversation_id"]
+        write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": saved_id})
+        conversation = self.conversation_path(account, saved_id)
         record = read_private(conversation) if conversation.exists() else None
         if record is None or not contact_receipt_usable(record.get("receipt")):
             raise ClientError("invalid_state", "The saved contact has no conversation record; nothing was sent.")
@@ -2290,8 +2321,8 @@ class Client:
                       "To send a new contact deliberately (it may duplicate the earlier one), repeat the command with --new-conversation. The earlier contact stays saved."])
         if not contact_receipt_usable(legacy.get("receipt")):
             raise unverified
-        conversation_id = legacy["receipt"]["conversation_id"]
-        self.claim_legacy(self.legacy_records(conversation_id) or [(legacy_path.name, legacy)], account, "initiator", unverified)
+        conversation_id = legacy["receipt"]["conversation_id"].lower()
+        self.claim_legacy(self.legacy_records(conversation_id) or [(legacy_path.name, legacy)], account, conversation_id, "initiator", unverified, True)
         index = {"account_id": account, "conversation_id": conversation_id}
         write_private(path, index)
         return index
@@ -2300,7 +2331,7 @@ class Client:
     def record_of(path, record, conversation_id):
         """An explicit id acts only on the record of exactly that conversation: anything else is refused before a request is made."""
         receipt = record.get("receipt") if isinstance(record, dict) else None
-        if not isinstance(receipt, dict) or receipt.get("conversation_id") != conversation_id:
+        if receipt_conversation(receipt) != conversation_id.lower():
             raise ClientError("invalid_state", "The saved record does not belong to the conversation named; nothing was sent.")
         return path, record
 
@@ -2317,6 +2348,8 @@ class Client:
             pointer_path = self.pointer_path(account)
             if pointer_path.exists():
                 pointer = read_private(pointer_path)
+                if not isinstance(pointer, dict):
+                    raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
                 conversation_id = pointer.get("conversation_id")
                 if conversation_id is None:
                     # A contact whose answer is not known yet: only repeating it can settle it.
@@ -2324,17 +2357,19 @@ class Client:
             elif self.last_conversation_path.exists():
                 # The pointer of an earlier client: read, never rewritten. Its conversation is opened by the same evidence.
                 pointer = read_private(self.last_conversation_path)
-                filename = pointer.get("record", "")
-                if not isinstance(filename, str) or not re.fullmatch(r"[a-f0-9]{64}\.json", filename):
+                filename = pointer.get("record", "") if isinstance(pointer, dict) else None
+                if (not isinstance(filename, str) or not re.fullmatch(r"[a-f0-9]{64}\.json", filename) or
+                        not (self.conversations / filename).exists()):
                     raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
                 earlier = read_private(self.conversations / filename)
                 receipt = earlier.get("receipt") if isinstance(earlier, dict) else None
                 if self.record_owner(earlier) is not None or not isinstance(receipt, dict) or not uuid_text(receipt.get("conversation_id")):
                     raise ClientError("conversation_uncertain", "The earlier client's contact has no recorded answer and is not sent again; see the contact command's guidance.",
                                       guidance=["Its answer may have been lost after delivery: look for it in this account's conversations (GET /v4/conversations), or repeat the contact command with --new-conversation to send a new one deliberately."])
-                path, record = self.claim_legacy(self.legacy_records(receipt["conversation_id"]) or [(filename, earlier)], account, side, unverified)
-                write_private(pointer_path, {"account_id": account, "conversation_id": receipt["conversation_id"]})
-                return self.record_of(path, record, receipt["conversation_id"])
+                saved_id = receipt["conversation_id"].lower()
+                path, record = self.claim_legacy(self.legacy_records(saved_id) or [(filename, earlier)], account, saved_id, side, unverified, True)
+                write_private(pointer_path, {"account_id": account, "conversation_id": saved_id})
+                return self.record_of(path, record, saved_id)
             else:
                 raise ClientError("no_conversation", "No saved conversation; use contact with a capability returned by discovery.")
             conversation_id = self.identifier(conversation_id, "conversation_id")
@@ -2346,7 +2381,7 @@ class Client:
             return self.record_of(path, record, conversation_id)
         legacies = self.legacy_records(conversation_id)
         if legacies:
-            path, record = self.claim_legacy(legacies, account, side, unverified)
+            path, record = self.claim_legacy(legacies, account, conversation_id, side, unverified, False)
         else:
             # Nothing is saved for this account before Needwing showed the conversation to it.
             self.visible_to_account(conversation_id, None, side)
@@ -2548,6 +2583,12 @@ class Client:
                 record = read_private(index_path)
         return index_path, record
 
+    def bind_account(self, account_id):
+        """Cache a confirmed account id together with the connection (grant or named key) it was confirmed with. The id is only ever
+        used as the binding of that same connection: another credential (a different key, a new sign-in) reads the account again."""
+        self.identity["account_id"] = account_id
+        self.identity["account_connection"] = self.connection_id()
+
     def bound_account(self):
         """The account id this connection's account-bound calls name in the
         Needwing-Expected-Account header: the id the last identity read confirmed
@@ -2559,9 +2600,19 @@ class Client:
         string, or an explicit null) fails closed here (invalid_state, nothing
         sent) rather than being silently dropped: a corrupt cache must never turn
         into an unprotected call, and "run account" is the read that heals it.
+        The cached id belongs to the connection it was confirmed with
+        (`account_connection`): with no credential, or another one (a different named
+        key, a new sign-in), it is not a binding at all and None is returned, so the
+        next account read decides — the id stays on disk so that read still detects a
+        credential that moved to another account, and a rotated key of the same
+        account just takes the binding over.
         It is a cache of a server-confirmed fact, never an authority: the send-point
         checks and Needwing's 409 own the decision."""
+        if self.tokens() is None and not self.api_key():
+            return None
         if "account_id" in self.identity:
+            if self.identity.get("account_connection") != self.connection_id():
+                return None
             source = "account_id"
         elif (self.tokens() or {}).get("kind") == "trial" and "trial_account_id" in self.identity:
             # A state directory written before this change cached only the
@@ -2697,7 +2748,7 @@ class Client:
         if isinstance(started_for, str) and started_for.lower() != current.lower():
             self.identity.pop("trial_sign_in", None)
             self.identity.pop("login_requested", None)
-        self.identity["account_id"] = current
+        self.bind_account(current)
         write_private(self.identity_path, self.identity)
         return current
 
