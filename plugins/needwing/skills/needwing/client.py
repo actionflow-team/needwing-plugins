@@ -510,6 +510,7 @@ class Client:
         self.legacy_root = self.state / "legacy-2.1"
         self.legacy_conversations = self.legacy_root / "conversations"
         self.legacy_pointer = self.legacy_root / "last-conversation.json"
+        self.pointer_ambiguous_path = self.legacy_root / "pointer-ambiguous.json"
         self.providers = self.state / "providers"
         private_dir(self.providers)
         self.tools = self.state / "tools"
@@ -926,9 +927,6 @@ class Client:
             return
         tokens = self.tokens()
         kind = (tokens or {}).get("kind") or "trial"
-        if self.earlier_refresh_marker(tokens) and not (kind == "trial" and self.request_id_recoverable()):
-            self.retry_earlier_refresh(tokens, kind)
-            return
         if kind == "trial" and self.request_id_recoverable():
             try:
                 self.register_trial(self.identity.get("client_name"))
@@ -941,43 +939,6 @@ class Client:
             return
         self.forget_connection()
         raise self.reconnect_required(kind)
-
-    def earlier_refresh_marker(self, tokens):
-        """Whether the in-flight marker was left by an earlier client (2.1.0) for the pair saved now: that client wrote it before a
-        refresh it could no longer complete (Needwing refuses it below the minimum version), so the marker proves nothing about
-        whether the token was spent. This client's own markers carry its version and stay ambiguous until settled."""
-        marker = self.identity.get("refresh_in_flight")
-        token = (tokens or {}).get("refresh_token")
-        return (isinstance(marker, dict) and "client" not in marker and isinstance(token, str) and bool(token) and
-                marker.get("token_sha256") == hashlib.sha256(token.encode("utf-8")).hexdigest())
-
-    def retry_earlier_refresh(self, tokens, kind):
-        """Try the refresh once with the pair an earlier client's marker covers, instead of discarding it. An unspent token is
-        refreshed and the grant, and a trial past its replay window, stays. A spent one is answered `invalid_grant` and the person
-        reconnects, as before. Nothing the person still holds is revoked by this: Needwing revokes a refresh family only when a
-        spent token is replayed after its 60 second grace, and the only successor such a token can have is the pair of a refresh
-        whose answer was lost before the earlier client could save it, which nobody holds; inside the grace the same call returns
-        that pair instead. The marker is replaced by this client's own before the send (an unknown outcome is never retried), and
-        restored when the service refused before processing (429, 503, below the minimum version)."""
-        earlier = self.identity["refresh_in_flight"]
-        self.identity["refresh_in_flight"] = {
-            "token_sha256": earlier["token_sha256"], "started_at": int(time.time()), "client": CLIENT_VERSION}
-        write_private(self.identity_path, self.identity)
-        try:
-            result = self.call("POST", "/oauth/token", form={
-                "grant_type": "refresh_token", "client_id": OAUTH_CLIENT, "refresh_token": tokens["refresh_token"]})
-        except ClientError as exc:
-            if exc.payload.get("code") == "invalid_grant":
-                self.forget_connection()
-                raise self.reconnect_required(kind) from None
-            if exc.payload.get("http_status") in (429, 503) or exc.payload.get("code") == "upgrade_required":
-                self.identity["refresh_in_flight"] = earlier
-                write_private(self.identity_path, self.identity)
-            raise
-        if not isinstance(result.get("access_token"), str) or not result.get("access_token"):
-            raise ClientError("invalid_response",
-                              "The token response was incomplete. The refresh is treated as used: the next command recovers or asks to reconnect.")
-        self.save_tokens(result, kind, same_grant=True)
 
     def refresh_tokens(self):
         self.settle_refresh()
@@ -2131,7 +2092,10 @@ class Client:
         return and no record to overwrite. It cannot change anything at Needwing (its requests are refused below the minimum
         version), so moving loses nothing; a file it writes later is moved by the next call. A file that names an account is this
         client's own (an older build kept it there) and goes to its directory. A name already taken keeps the older file;
-        the newcomer is stored under another name: nothing is overwritten. Idempotent and crash-safe: a stop between two renames leaves every file in
+        the newcomer is stored under another name: nothing is overwritten. The default pointer is moved the same way: an
+        earlier pointer already moved is never replaced, and an incoming pointer whose file collided is ambiguous (it names the
+        older file but meant the newcomer). Either way the incoming one is kept beside it and `pointer-ambiguous.json` is written
+        first: no default-pointer action uses an earlier pointer then (the conversation must be named). Idempotent and crash-safe: a stop between two renames leaves every file in
         exactly one place."""
         if self.earlier_conversations.is_symlink() or self.last_conversation_path.is_symlink():
             raise ClientError("unsafe_state", "Private state must not use symbolic links or reparse points.")
@@ -2139,6 +2103,7 @@ class Client:
         has_pointer = self.last_conversation_path.exists()
         if not sources and not has_pointer:
             return
+        collided = set()
         for source in sources:
             try:
                 if not stat.S_ISREG(source.lstat().st_mode):
@@ -2155,10 +2120,19 @@ class Client:
             if target.exists():
                 # The file already moved keeps its name (and the identity its send is tracked by); the newcomer gets another.
                 target = directory / (source.stem + "." + str(time.time_ns()) + ".json")
+                collided.add(source.name)
             os.replace(source, target)
         if has_pointer:
             private_dir(self.legacy_root)
-            os.replace(self.last_conversation_path, self.legacy_pointer)
+            try:
+                named = read_private(self.last_conversation_path).get("record")
+            except (ClientError, OSError, ValueError, AttributeError):
+                named = None
+            if self.legacy_pointer.exists() or named in collided:
+                write_private(self.pointer_ambiguous_path, {"reason": "an earlier default pointer could not be kept apart"})
+                os.replace(self.last_conversation_path, self.legacy_root / ("last-conversation." + str(time.time_ns()) + ".json"))
+            else:
+                os.replace(self.last_conversation_path, self.legacy_pointer)
 
     def legacy_records(self, conversation_id):
         """Records an earlier client (2.1.0) saved for this conversation: they name no account. Read only, never changed."""
@@ -2389,8 +2363,9 @@ class Client:
         # the contact's own ids (to replay that one contact), afterwards only the conversation id; the conversation lives in its record.
         fingerprint = hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
         path = self.conversations / (fingerprint + ".json")
-        index = read_private(path) if path.exists() else None
-        if index is not None and (not isinstance(index, dict) or ("conversation_id" in index and not uuid_text(index["conversation_id"]))):
+        saved = path.exists()
+        index = read_private(path) if saved else None
+        if saved and not isinstance(index, dict):
             raise ClientError("invalid_state", "The saved contact is invalid; nothing was sent.")
         if index is not None and "receipt" in index and "conversation_id" not in index:
             # State written by an earlier client may hold a receipt: one that was never a receipt leaves the contact unconfirmed (replayed with its own ids).
@@ -2403,6 +2378,8 @@ class Client:
                                   {"account_id": account, "conversation_id": earlier["conversation_id"], "side": "initiator", "receipt": earlier})
                 index.pop("body", None)
             write_private(path, index)
+        if index is not None:
+            self.check_contact_index(index, account, capability_id, text)
         if index is None and not new_conversation:
             index = self.legacy_contact(path, account, capability_id, text)
         if index is not None and new_conversation:
@@ -2433,14 +2410,30 @@ class Client:
             write_private(path, {"account_id": account, "conversation_id": result["conversation_id"]})
             write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": result["conversation_id"]})
             return result
-        saved_id = index["conversation_id"].lower() if isinstance(index["conversation_id"], str) else index["conversation_id"]
-        write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": saved_id})
+        saved_id = index["conversation_id"].lower()
         conversation = self.conversation_path(account, saved_id)
         record = self.canonical_record(conversation, account, saved_id)
         if record is None or not contact_receipt_usable(record.get("receipt")):
             raise ClientError("invalid_state", "The saved contact has no conversation record; nothing was sent.")
+        # The default pointer moves to this contact only once its record is known to be sound.
+        write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": saved_id})
         self.refresh_legacy_sends(conversation, record)
         return record["receipt"]
+
+    def check_contact_index(self, index, account, capability_id, text):
+        """An existing contact index is this account's and holds either the conversation it resolved to or the complete request still
+        to be sent (replayed with its own ids). Anything else is damaged: `invalid_state`, before anything is sent or pointed at."""
+        owner = self.record_owner(index)
+        body = index.get("body")
+        message = body.get("first_message") if isinstance(body, dict) else None
+        if "conversation_id" in index:
+            sound = uuid_text(index["conversation_id"])
+        else:
+            sound = (isinstance(message, dict) and isinstance(message.get("client_message_id"), str) and
+                     isinstance(body.get("client_conversation_id"), str) and body.get("capability_id") == capability_id and
+                     message.get("parts") == [{"kind": "text", "text": text}])
+        if not sound or (owner is not None and owner != account):
+            raise ClientError("invalid_state", "The saved contact is invalid; nothing was sent.")
 
     def legacy_contact(self, path, account, capability_id, text):
         """The contact an earlier client (2.1.0) saved for this capability and text lives under a fingerprint without an account and is
@@ -2497,6 +2490,12 @@ class Client:
                 if conversation_id is None:
                     # A contact whose answer is not known yet: only repeating it can settle it.
                     raise ClientError("conversation_uncertain", "Repeat the original contact command; keep the saved request and identity.")
+            elif self.pointer_ambiguous_path.exists():
+                raise ClientError(
+                    "conversation_uncertain",
+                    "More than one earlier default conversation was saved in this state directory, so none is used without being named; nothing was sent.",
+                    guidance=["Repeat the command with --conversation-id <id> (GET /v4/conversations lists this account's conversations), or repeat the original contact command.",
+                              "A new contact of the earlier client that was refused may have left its pointer here; it is not a conversation."])
             elif self.legacy_pointer.exists():
                 # The pointer of an earlier client (moved aside): read, never rewritten. Its conversation is opened by the same evidence.
                 pointer = read_private(self.legacy_pointer)
@@ -3475,6 +3474,7 @@ def main(argv=None):
     try:
         with StateLock(args.state_dir):
             client = Client(args.base_url, args.state_dir, args.ca_file)
+            client.adopt_earlier_files()  # every command, under the state lock: what the earlier client left is out of its reach first
             client.note_command("provider " + args.provider_command if args.command == "provider" else args.command)
             client.check_version()
             if args.command == "connect":
