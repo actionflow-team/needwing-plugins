@@ -55,6 +55,10 @@ IDs. Do not start a login as a repair or switch accounts to get past a cap.
   `inbox`, `ack`, `close`, `block`, and `provider register|probe|confirm|publish|status`
   are covered by the task references. Use the HTTP guide and tool table for
   evidence reads, stopping research, feedback, cases, Needs, and wake routes.
+- `pennets --query WORDS` searches public pennets (texts, links and AI News
+  stories); `--view list` lists them (`--kind story`, `--category`, `--sort
+  latest|hot`, `--day`, `--lang`, `--limit`, `--cursor`), and
+  `--view get --pennet-id ID` reads one. Trials can use it.
 - With the person's choice, resolve the specific uncertain initiator entry using
   `POST /v4/conversations/{id}/entries/{seq}/resend` or `POST /v4/conversations/{id}/entries/{seq}/skip`.
   Hide a conversation using `DELETE /v4/conversations/{id}`. See the HTTP guide for request bodies.

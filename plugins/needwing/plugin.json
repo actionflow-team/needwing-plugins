@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "needwing",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
   "author": {
     "name": "Needwing",

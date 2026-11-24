@@ -78,7 +78,7 @@ if os.name == "nt":
     import msvcrt
 
 DEFAULT_ORIGIN = "https://needwing.ai"
-CLIENT_VERSION = "2.0.0"  # Synced from the Needwing service contracts.
+CLIENT_VERSION = "2.1.0"  # Synced from the Needwing service contracts.
 VERSION_PATH = "/api/connect/version"
 CLIENT_PATH = "/api/connect/client.py"
 UPGRADE_REQUIRED_EXIT = 3
@@ -1933,6 +1933,22 @@ class Client:
         write_private(self.state / "discovery.json", result)
         return result
 
+    def pennets(self, view="search", query=None, pennet_id=None, kind=None, category=None, sort=None, day=None,
+                lang=None, cursor=None, limit=None, confirm_account=None):
+        """Search, list or read public pennets (stored public texts, links and AI News stories); no model, no ledger."""
+        self.resolve_account_change(confirm_account)
+        if view == "get":
+            if not pennet_id:
+                raise ClientError("pennet_id_required", "Pass --pennet-id to read one pennet.")
+            if not re.fullmatch(r"pnt_[A-Za-z0-9]{1,64}", pennet_id):
+                raise ClientError("invalid_identifier", "Use an actual pennet_id returned by Needwing.")
+            return self.authorized("GET", "/v4/pennets/" + pennet_id)
+        if view == "search" and not query:
+            raise ClientError("query_required", "Pass --query to search pennets, or use --view list.")
+        params = {"view": view, "q": query, "kind": kind, "category": category, "sort": sort, "day": day, "lang": lang,
+                  "cursor": cursor, "limit": limit}
+        return self.authorized("GET", "/v4/pennets?" + parse.urlencode({k: v for k, v in params.items() if v not in (None, "")}))
+
     def contact(self, capability_id, text, new_conversation=False, confirm_account=None):
         self.resolve_account_change(confirm_account)
         capability_id = self.identifier(capability_id, "capability_id")
@@ -2739,7 +2755,7 @@ def confirm_option(subparser):
 # Exactly the commands wired with confirm_option above (provider ones as "provider <sub>"):
 # guidance may name any of these with --confirm-account, and no other command.
 CONFIRM_COMMANDS = frozenset({
-    "run", "status", "diagnose", "followup", "discover", "contact", "send",
+    "run", "status", "diagnose", "followup", "discover", "pennets", "contact", "send",
     "conversation", "inbox", "ack", "close", "block", "signup", "verify",
     "provider register", "provider probe", "provider confirm", "provider publish",
 })
@@ -2801,6 +2817,18 @@ def main(argv=None):
     discover = commands.add_parser("discover", help="Read published supplies without contacting them")
     discover.add_argument("--request-file", required=True, help="UTF-8 natural request")
     confirm_option(discover)
+    pennets = commands.add_parser("pennets", help="Search, list or read public pennets (texts, links and AI News stories); trials included")
+    pennets.add_argument("--view", choices=["search", "list", "get"], default="search")
+    pennets.add_argument("--query", help="Search words (view search)")
+    pennets.add_argument("--pennet-id", help="One pennet to read (view get)")
+    pennets.add_argument("--kind", choices=["text", "link", "story"], help="story = AI News stories")
+    pennets.add_argument("--category", choices=["models", "products", "papers", "open_source", "policy", "daily"])
+    pennets.add_argument("--sort", choices=["latest", "hot"])
+    pennets.add_argument("--day", help="YYYY-MM-DD")
+    pennets.add_argument("--lang")
+    pennets.add_argument("--cursor", help="next_cursor from the previous page")
+    pennets.add_argument("--limit", type=int, help="At most 30")
+    confirm_option(pennets)
     contact = commands.add_parser("contact", help="Start or resume a consultation with a discovered supply")
     contact.add_argument("--capability-id", required=True, help="Actual capability_id from discovery or research evidence")
     contact.add_argument("--message-file", required=True)
@@ -2876,6 +2904,9 @@ def main(argv=None):
                                          "auto" if args.auto else args.integration, args.new_follow_up, args.confirm_account)
             elif args.command == "discover":
                 result = client.discover(Path(args.request_file).read_text(encoding="utf-8"), args.confirm_account)
+            elif args.command == "pennets":
+                result = client.pennets(args.view, args.query, args.pennet_id, args.kind, args.category, args.sort, args.day,
+                                        args.lang, args.cursor, args.limit, args.confirm_account)
             elif args.command == "contact":
                 result = client.contact(args.capability_id, Path(args.message_file).read_text(encoding="utf-8"),
                                         args.new_conversation, args.confirm_account)
