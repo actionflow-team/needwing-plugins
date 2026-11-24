@@ -2063,6 +2063,46 @@ class Client:
         """The last-conversation pointer of one account. The pointer of an earlier client (`last-conversation.json`) is only read."""
         return self.state / ("last-conversation-" + account + ".json")
 
+    def marker_sequence(self):
+        """The sequence stored in the ambiguity marker; None when there is no marker. A marker that cannot be read, or that names
+        no sequence, counts as 0: it still invalidates every pointer that names no later sequence."""
+        if not self.pointer_ambiguous_path.exists():
+            return None
+        try:
+            value = read_private(self.pointer_ambiguous_path).get("seq")
+        except (ClientError, OSError, ValueError, AttributeError):
+            return 0
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    def write_pointer(self, account, fields):
+        """Write an account's pointer with a sequence that is later than the ambiguity marker's: a pointer written now is a choice
+        made after the ambiguity and is used by default; one written before it is not."""
+        marker = self.marker_sequence()
+        write_private(self.pointer_path(account), {**fields, "account_id": account,
+                                                   "seq": max(time.time_ns(), (marker or 0) + 1)})
+
+    def mark_pointer_ambiguous(self):
+        """Persist the decision that no earlier default is known: the marker's sequence is later than every account pointer's and than
+        the marker's own, so every default chosen before this point must be named again."""
+        latest = self.marker_sequence() or 0
+        for candidate in self.state.glob("last-conversation-*.json"):
+            try:
+                value = read_private(candidate).get("seq")
+            except (ClientError, OSError, ValueError, AttributeError):
+                continue
+            if isinstance(value, int) and not isinstance(value, bool):
+                latest = max(latest, value)
+        private_dir(self.legacy_root)
+        write_private(self.pointer_ambiguous_path, {"reason": "an earlier default pointer could not be kept apart",
+                                                    "seq": max(time.time_ns(), latest + 1)})
+
+    def ambiguous_default(self):
+        return ClientError(
+            "conversation_uncertain",
+            "More than one earlier default conversation was saved in this state directory, so none is used without being named; nothing was sent.",
+            guidance=["Repeat the command with --conversation-id <id> (GET /v4/conversations lists this account's conversations), or repeat the original contact command.",
+                      "A new contact of the earlier client that was refused may have left its pointer here; it is not a conversation."])
+
     def account_record_path(self, account, body):
         """Where an account's contact record lives: a fingerprint of the account, the capability and the text."""
         try:
@@ -2094,16 +2134,28 @@ class Client:
         client's own (an older build kept it there) and goes to its directory. A name already taken keeps the older file;
         the newcomer is stored under another name: nothing is overwritten. The default pointer is moved the same way: an
         earlier pointer already moved is never replaced, and an incoming pointer whose file collided is ambiguous (it names the
-        older file but meant the newcomer). Either way the incoming one is kept beside it and `pointer-ambiguous.json` is written
-        first: no default-pointer action uses an earlier pointer then (the conversation must be named). Idempotent and crash-safe: a stop between two renames leaves every file in
-        exactly one place."""
+        older file but meant the newcomer), and so is one that cannot be read as naming a file. Either way the incoming one is kept
+        beside it and `pointer-ambiguous.json` (with a sequence) is written before any file moves: no default is used that was
+        chosen before it (the conversation must be named). Idempotent and crash-safe: a stop between two writes leaves every file in
+        exactly one place and the decision on disk; a resumed move finds the marker, which no default chosen before it outlives."""
         if self.earlier_conversations.is_symlink() or self.last_conversation_path.is_symlink():
             raise ClientError("unsafe_state", "Private state must not use symbolic links or reparse points.")
         sources = sorted(self.earlier_conversations.glob("*.json")) if self.earlier_conversations.is_dir() else []
         has_pointer = self.last_conversation_path.exists()
         if not sources and not has_pointer:
             return
-        collided = set()
+        if has_pointer:
+            # The decision is persisted before anything it depends on moves: a stop at any later write resumes still ambiguous.
+            private_dir(self.legacy_root)
+            try:
+                named = read_private(self.last_conversation_path).get("record")
+            except (ClientError, OSError, ValueError, AttributeError):
+                named = None
+            names = {source.name for source in sources}
+            ambiguous = (not isinstance(named, str) or self.legacy_pointer.exists() or
+                         (named in names and ((self.conversations / named).exists() or (self.legacy_conversations / named).exists())))
+            if ambiguous:
+                self.mark_pointer_ambiguous()
         for source in sources:
             try:
                 if not stat.S_ISREG(source.lstat().st_mode):
@@ -2120,16 +2172,9 @@ class Client:
             if target.exists():
                 # The file already moved keeps its name (and the identity its send is tracked by); the newcomer gets another.
                 target = directory / (source.stem + "." + str(time.time_ns()) + ".json")
-                collided.add(source.name)
             os.replace(source, target)
         if has_pointer:
-            private_dir(self.legacy_root)
-            try:
-                named = read_private(self.last_conversation_path).get("record")
-            except (ClientError, OSError, ValueError, AttributeError):
-                named = None
-            if self.legacy_pointer.exists() or named in collided:
-                write_private(self.pointer_ambiguous_path, {"reason": "an earlier default pointer could not be kept apart"})
+            if ambiguous:
                 os.replace(self.last_conversation_path, self.legacy_root / ("last-conversation." + str(time.time_ns()) + ".json"))
             else:
                 os.replace(self.last_conversation_path, self.legacy_pointer)
@@ -2394,7 +2439,7 @@ class Client:
                                                 "parts": [{"kind": "text", "text": text}]}}}
             write_private(path, index)
         if "conversation_id" not in index:
-            write_private(self.pointer_path(account), {"record": path.name, "account_id": account})
+            self.write_pointer(account, {"record": path.name})
             result = self.authorized("POST", "/v4/conversations", index["body"])
             if not contact_receipt_usable(result):
                 raise uncertain_write("invalid_receipt", "The contact answer carried no usable conversation receipt; nothing was saved as sent.")
@@ -2408,7 +2453,7 @@ class Client:
                 record = {"account_id": account, "conversation_id": result["conversation_id"], "side": "initiator", "receipt": result}
             write_private(conversation, record)
             write_private(path, {"account_id": account, "conversation_id": result["conversation_id"]})
-            write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": result["conversation_id"]})
+            self.write_pointer(account, {"record": path.name, "conversation_id": result["conversation_id"]})
             return result
         saved_id = index["conversation_id"].lower()
         conversation = self.conversation_path(account, saved_id)
@@ -2416,7 +2461,7 @@ class Client:
         if record is None or not contact_receipt_usable(record.get("receipt")):
             raise ClientError("invalid_state", "The saved contact has no conversation record; nothing was sent.")
         # The default pointer moves to this contact only once its record is known to be sound.
-        write_private(self.pointer_path(account), {"record": path.name, "account_id": account, "conversation_id": saved_id})
+        self.write_pointer(account, {"record": path.name, "conversation_id": saved_id})
         self.refresh_legacy_sends(conversation, record)
         return record["receipt"]
 
@@ -2480,22 +2525,23 @@ class Client:
             "legacy_conversation_unverified",
             "A conversation saved by an earlier client version cannot be shown to be this account's, so it was not used.",
             guidance=["Use contact with a capability returned by discovery, or sign in as the account that started it."])
+        named = conversation_id is not None
         if conversation_id is None:
             pointer_path = self.pointer_path(account)
             if pointer_path.exists():
                 pointer = read_private(pointer_path)
                 if not isinstance(pointer, dict):
                     raise ClientError("invalid_state", "The saved conversation pointer is invalid.")
+                marker = self.marker_sequence()
+                sequence = pointer.get("seq")
+                if marker is not None and not (isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > marker):
+                    raise self.ambiguous_default()  # chosen before the ambiguity: it must be named again
                 conversation_id = pointer.get("conversation_id")
                 if conversation_id is None:
                     # A contact whose answer is not known yet: only repeating it can settle it.
                     raise ClientError("conversation_uncertain", "Repeat the original contact command; keep the saved request and identity.")
             elif self.pointer_ambiguous_path.exists():
-                raise ClientError(
-                    "conversation_uncertain",
-                    "More than one earlier default conversation was saved in this state directory, so none is used without being named; nothing was sent.",
-                    guidance=["Repeat the command with --conversation-id <id> (GET /v4/conversations lists this account's conversations), or repeat the original contact command.",
-                              "A new contact of the earlier client that was refused may have left its pointer here; it is not a conversation."])
+                raise self.ambiguous_default()
             elif self.legacy_pointer.exists():
                 # The pointer of an earlier client (moved aside): read, never rewritten. Its conversation is opened by the same evidence.
                 pointer = read_private(self.legacy_pointer)
@@ -2510,7 +2556,7 @@ class Client:
                                       guidance=["Its answer may have been lost after delivery: look for it in this account's conversations (GET /v4/conversations), or repeat the contact command with --new-conversation to send a new one deliberately."])
                 saved_id = receipt["conversation_id"].lower()
                 path, record = self.claim_legacy(self.legacy_records(saved_id) or [(filename, earlier)], account, saved_id, side, unverified, True)
-                write_private(pointer_path, {"account_id": account, "conversation_id": saved_id})
+                self.write_pointer(account, {"conversation_id": saved_id})
                 return self.record_of(path, record, saved_id)
             else:
                 raise ClientError("no_conversation", "No saved conversation; use contact with a capability returned by discovery.")
@@ -2520,6 +2566,8 @@ class Client:
         path = self.conversation_path(account, conversation_id)
         if path.exists():
             record = self.canonical_record(path, account, conversation_id)
+            if named and self.marker_sequence() is not None:
+                self.write_pointer(account, {"conversation_id": conversation_id})  # naming it is the choice the ambiguity asked for
             return path, self.refresh_legacy_sends(path, record)
         legacies = self.legacy_records(conversation_id)
         if legacies:
@@ -2529,6 +2577,8 @@ class Client:
             self.visible_to_account(conversation_id, None, side)
             record = {"account_id": account, "conversation_id": conversation_id, "side": side, "receipt": {"conversation_id": conversation_id}}
             write_private(path, record)
+        if named and self.marker_sequence() is not None:
+            self.write_pointer(account, {"conversation_id": conversation_id})
         return self.record_of(path, record, conversation_id)
 
     def send(self, text, conversation_id=None, new_message=False, confirm_account=None):
