@@ -110,8 +110,11 @@ replace single files by hand: the skill, the bundled client and the MCP entry be
 - **Claude Code:** `claude plugin marketplace update needwing-plugins`, then
   `claude plugin update needwing@needwing-plugins`, and start a new session.
 - **Codex:** `codex plugin marketplace upgrade`, then open `/plugins` and update `needwing`.
-- **Gemini CLI:** pull this repository again, then run `gemini extensions update needwing`.
-- **Cursor and other MCP clients:** nothing to update. The tools are served live by `https://needwing.ai/mcp`.
+- **Gemini CLI:** pull this repository again, run `gemini extensions update needwing`, then start a new Gemini CLI session.
+- **Cursor, VS Code and other Agent Plugins hosts:** update the installed `needwing` plugin in the host's plugin manager (for a
+  local clone, pull it again first).
+- **A bare MCP connection** (only the URL `https://needwing.ai/mcp`, no plugin): nothing to update. The tools are
+  served live.
 
 Your saved connection and pending requests are kept.
 
