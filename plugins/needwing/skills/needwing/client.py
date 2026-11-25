@@ -123,6 +123,66 @@ UNCERTAIN_WRITE_GUIDANCE = [
 ]
 
 
+PLUGIN_MARKER_FILE = "plugin-bundle.json"
+PLUGIN_MARKER_MAX_BYTES = 1024
+PLUGIN_SEMVER_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+CLIENT_HEADER = "Needwing-Client"
+
+
+def plugin_marker(directory):
+    """The `(plugin, skill)` versions a plugin bundle declares next to this file, or None.
+
+    The marker is a data-only file the plugin build writes (`{"plugin": "X.Y.Z", "skill": "X.Y.Z"}`). Anything else
+    (no file, not a regular file, over 1 KB, not JSON, another shape, another key, a version that is not plain
+    X.Y.Z of at most 32 characters) means this is not a bundle: silently no marker, never an error.
+    """
+    try:
+        path = Path(directory) / PLUGIN_MARKER_FILE
+        if not path.is_file():
+            return None
+        with open(path, "rb") as handle:
+            raw = handle.read(PLUGIN_MARKER_MAX_BYTES + 1)
+        if len(raw) > PLUGIN_MARKER_MAX_BYTES:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"plugin", "skill"}:
+        return None
+    versions = []
+    for key in ("plugin", "skill"):
+        version = value[key]
+        if (not isinstance(version, str) or len(version) > 32
+                or not PLUGIN_SEMVER_PATTERN.fullmatch(version)):
+            return None
+        versions.append(version)
+    return tuple(versions)
+
+
+try:
+    PLUGIN = plugin_marker(Path(__file__).resolve().parent)
+except (NameError, OSError, RuntimeError):
+    PLUGIN = None
+
+
+def identity_headers(marker=None):
+    """User-Agent (and `Needwing-Client`, advisory identification only) for one request.
+
+    The User-Agent keeps `needwing-client/<version>` followed by a space when it carries the bundle suffix: the service's
+    minimum check reads exactly that prefix.
+    """
+    marker = PLUGIN if marker is None else marker
+    if not marker:
+        return {"User-Agent": "needwing-client/" + CLIENT_VERSION}
+    plugin, skill = marker
+    return {"User-Agent": f"needwing-client/{CLIENT_VERSION} (plugin {plugin}; skill {skill})",
+            CLIENT_HEADER: f"plugin/{plugin}; skill={skill}"}
+
+
+PLUGIN_UPDATE_STEP = ("Tell the person to update the Needwing plugin in their host's plugin manager; "
+                      "do not download or replace files yourself.")
+
+
 def uncertain_write(code, message):
     """The one error for a write whose answer cannot be trusted: it says the write may have landed and how to reconcile it."""
     return ClientError(code, message, guidance=list(UNCERTAIN_WRITE_GUIDANCE))
@@ -676,7 +736,7 @@ class Client:
     def call(self, method, path, body=None, idempotency_key=None, form=None, expected_account=None):
         if not (path.startswith("/v4/") or path.startswith("/oauth/") or path == VERSION_PATH):
             raise ClientError("invalid_path", "Only Needwing runtime paths are supported.")
-        headers = {"Accept": "application/json", "User-Agent": "needwing-client/" + CLIENT_VERSION}
+        headers = {"Accept": "application/json", **identity_headers()}
         data = None
         if form is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -745,6 +805,13 @@ class Client:
             # program to fix. The body's own code says less than its status: the 401 below
             # carries `upgrade_required` too.
             if exc.code == 426 or (upgrade_step and code == "invalid_target"):
+                if PLUGIN:
+                    # A plugin bundle is updated as a whole by its host: the client.py URL is never the action here.
+                    raise ClientError("upgrade_required",
+                                      "This Needwing plugin is too old for the service and nothing ran. " + PLUGIN_UPDATE_STEP,
+                                      http_status=exc.code,
+                                      guidance=["Update the Needwing plugin in the host's plugin manager, then start again. " +
+                                                "This call changed nothing; keep any saved state and pending receipts."]) from None
                 message = detail.get("message") or envelope.get("message") or envelope.get("error_description")
                 if not isinstance(message, str) or not message.isprintable() or not 0 < len(message) <= 400:
                     message = "Download the current Needwing client and start again."
@@ -987,17 +1054,26 @@ class Client:
         # Cache the attempt too, so an unavailable endpoint does not delay every command.
         write_private(cache_path, {"checked_at": now})
         try:
-            info = self.call("GET", VERSION_PATH).get("client")
+            answer = self.call("GET", VERSION_PATH)
         except ClientError as exc:
             if exc.payload.get("code") == "upgrade_required":
                 raise
             return
+        # A plugin bundle compares the plugin version it carries; any other install compares the client.
+        info = answer.get("plugin" if PLUGIN else "client")
+        installed = PLUGIN[0] if PLUGIN else CLIENT_VERSION
         if not isinstance(info, dict):
             return
         current = info.get("current")
         if not isinstance(current, str) or not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", current):
             return
-        if tuple(map(int, current.split("."))) > tuple(map(int, CLIENT_VERSION.split("."))):
+        if not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", installed):
+            return
+        if tuple(map(int, current.split("."))) > tuple(map(int, installed.split("."))):
+            if PLUGIN:
+                print(redact(f"A newer Needwing plugin is available ({installed} → {current}). {PLUGIN_UPDATE_STEP}",
+                             self.secrets()), file=sys.stderr)
+                return
             url = self.safe_next_url(info.get("url")) or self.base + CLIENT_PATH
             print(redact(f"A newer Needwing client is available ({CLIENT_VERSION} → {current}): {url}",
                          self.secrets()), file=sys.stderr)

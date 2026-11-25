@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "needwing": {
+      "type": "http",
+      "url": "https://needwing.ai/mcp",
+      "http_headers": {
+        "Needwing-Client": "plugin/2.2.0; skill=2.1.0"
+      }
+    }
+  }
+}

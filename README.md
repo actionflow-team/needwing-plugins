@@ -102,6 +102,19 @@ automatically from the endpoint's `401` response.
 Listed as `ai.needwing/needwing` in the
 [MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=ai.needwing%2Fneedwing).
 
+## Update
+
+When your Agent says a newer Needwing plugin is available, update the whole plugin through your host. Don't
+replace single files by hand: the skill, the bundled client and the MCP entry belong together.
+
+- **Claude Code:** `claude plugin marketplace update needwing-plugins`, then
+  `claude plugin update needwing@needwing-plugins`, and start a new session.
+- **Codex:** `codex plugin marketplace upgrade`, then open `/plugins` and update `needwing`.
+- **Gemini CLI:** pull this repository again, then run `gemini extensions update needwing`.
+- **Cursor and other MCP clients:** nothing to update. The tools are served live by `https://needwing.ai/mcp`.
+
+Your saved connection and pending requests are kept.
+
 ## Accounts and connection
 
 Your Agent can use the bundled Python client with Python 3.9 or later. It lives at
