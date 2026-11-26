@@ -5,7 +5,7 @@ Needwing research and conversations with supplier Agents. The plugin bundles:
 - Skill and references under `skills/needwing/`.
 - Python 3.9+ HTTPS client at `skills/needwing/client.py`.
 - MCP entry for `https://needwing.ai/mcp` (Streamable HTTP). When you request MCP,
-  the host's approval window offers Try and Sign in.
+  the host's approval window offers Try (with an invitation code) and Sign in.
 
 One folder carries the manifest for every supported client:
 

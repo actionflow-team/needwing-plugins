@@ -11,7 +11,7 @@ Use this reference when no client works and the host can add MCP, or at once whe
 | Cursor | In MCP settings add a server named `needwing` with URL `https://needwing.ai/mcp`, then connect. |
 | Other hosts | See the [host picker](https://needwing.ai/connect). If this host only supports a fixed authorization header, use [Account](account.md) to obtain a named key. |
 
-The window offers Try and Sign in; the person decides and approves. A window trial can run research and contact Agents within its caps. After signing up or signing in with the client, choose Sign in in the window with the same account. With own-only conversation visibility, use the original client to read conversations it opened. The person can grant all-conversation visibility in the window.
+The window offers Try and Sign in; the person decides and approves. A window trial can run research and contact Agents within its caps. After signing up or signing in with the client, choose Sign in in the window with the same account.
 
 If `sign_in_unavailable` appears, ask the person to reconnect the host and choose Sign in. A configured entry with no callable tools is pending or dormant. Keep any unresolved work on its original connection.
 

@@ -3,9 +3,12 @@
 
 Reuse the saved connection first; default to a trial only with fresh state.
 Do not ask an account-choice question. Keep one persistent private state directory.
+Ask the person for their invitation when starting a new trial or when sign-up
+requires one. Pass the code or invitation link via NEEDWING_INVITATION_CODE
+and never repeat it in chat. A saved trial request can replay without the code.
 
 connect  check or recover the saved identity; create a trial only with fresh state
-start    create or resume an anonymous trial account and store its token pair
+start    create or resume a trial account and store its token pair
 signup   print the Terms/Privacy links (--email is only needed together with
          --accept-terms), then convert the trial account to a limited
          account in chat once the person explicitly agrees
@@ -23,7 +26,7 @@ diagnose show this account's technical diagnostics (versions, account level,
          request ids, error codes; no task content, tokens or emails);
          --send files them as a support report, --summary TEXT adds context
 discover read published supplies without contacting them
-pennets  search, list or read public pennets (texts, links and AI News stories);
+pennets  search, list or read public pennets (short public Markdown texts);
          trials included
 web-search --query WORDS [--limit N]: one quick ranked web search (not research)
 web-read --url URL: read one public https page (a prefix when it is large)
@@ -89,7 +92,14 @@ if os.name == "nt":
     import msvcrt
 
 DEFAULT_ORIGIN = "https://needwing.ai"
-CLIENT_VERSION = "2.2.0"  # Synced from the Needwing service contracts.
+INVITATION_ERRORS = {
+    "invitation_required": (422, "Ask the person for their Needwing invitation code."),
+    "invitation_invalid": (404, "The invitation code is invalid. Ask the person for a valid Needwing invitation."),
+    "invitation_redeemed": (409, "This invitation has already been used. Ask the person for a new Needwing invitation."),
+    "invitation_expired": (409, "This invitation has expired. Ask the person for a new Needwing invitation."),
+    "invitation_revoked": (409, "This invitation has been revoked. Ask the person for a new Needwing invitation."),
+}
+CLIENT_VERSION = "2.2.2"  # Synced from the Needwing service contracts.
 VERSION_PATH = "/api/connect/version"
 CLIENT_PATH = "/api/connect/client.py"
 UPGRADE_REQUIRED_EXIT = 3
@@ -249,7 +259,7 @@ EXPECTED_ACCOUNT_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-
 DERIVED = object()
 A2A_CARD_FIELDS = ("card_url", "endpoint_challenge_id", "skill_id", "protocol_version")
 CARD_FIELDS = frozenset({"provider_external_id", "display_name", "capability_external_id", "description",
-                         "keywords", "reply_window_seconds", "visibility", "channel", "conversation",
+                         "keywords", "reply_window_seconds", "channel", "conversation",
                          "card_url", "endpoint_challenge_id", "skill_id", "protocol_version",
                          "accept_trial_contacts"})
 
@@ -273,12 +283,120 @@ def origin(value):
     return value.rstrip("/")
 
 
-def redact(text, secrets_list):
-    """The single output redaction: every printed line goes through here."""
-    for secret in secrets_list or []:
-        if isinstance(secret, str) and secret:
+# Whitespace as JavaScript's trim() and \s see it, so this client splits a pasted
+# message exactly as Needwing does.
+JS_WHITESPACE = ("\t\n\v\f\r \u00a0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200b))
+                 + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+JS_WHITESPACE_RUN = re.compile("[" + re.escape(JS_WHITESPACE) + "]+")
+INVITATION_CODE_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,200}")
+
+
+def normalize_invitation_code(value):
+    """The code in a bare code, an invitation link (".../invite#nwi_...") or a pasted
+    invitation message, by Needwing's rule: with a "#" present, the text after the last
+    "#" of the last whitespace-separated word that has one (an empty fragment stays
+    empty); without one, the whole trimmed text. Nothing is percent-decoded."""
+    text = (value or "").strip(JS_WHITESPACE)
+    if "#" in text:
+        link = [word for word in JS_WHITESPACE_RUN.split(text) if "#" in word][-1]
+        return link.rsplit("#", 1)[-1]
+    return text
+
+
+def usable_invitation_code(value):
+    """Needwing's judgement of a supplied string: the normalized code, or None where
+    Needwing answers 404 invitation_invalid (an empty or blank string included)."""
+    code = normalize_invitation_code(value)
+    return code if INVITATION_CODE_PATTERN.fullmatch(code) else None
+
+
+def supplied_invitation_code(value):
+    """(code, malformed): the code to send ("" when there is none to send), and whether
+    something was supplied that is not a code after normalization. A malformed value is
+    never sent; whether the request can go ahead without it is the caller's decision."""
+    code = usable_invitation_code(value)
+    if code is not None:
+        return code, False
+    return "", bool((value or "").strip(JS_WHITESPACE))
+
+
+def malformed_invitation_refusal(exc, malformed, base):
+    """Needwing asked for a code the person did supply, only malformed: say the code is
+    invalid (with the same guidance) rather than that none was given."""
+    if malformed and exc.payload.get("code") == "invitation_required":
+        status = exc.payload.get("http_status")
+        return invitation_error("invitation_invalid", base, **({"http_status": status} if status is not None else {}))
+    return None
+
+
+def invitation_error(code, base, **details):
+    return ClientError(code, INVITATION_ERRORS[code][1], **details,
+                       guidance=["Request an invitation at " + base + "/invite/request",
+                                 "Supply the code through NEEDWING_INVITATION_CODE and run the same command again."])
+
+
+# Real credentials are long: a secret of at least this length is replaced wherever it appears.
+# A shorter one is replaced only where it is a whole value or key, so a stray one-character
+# setting (a lone quote) can never rewrite ordinary text.
+SECRET_SUBSTRING_MIN = 8
+# The client's own printed envelope (the top-level result, or the error payload): its fixed field
+# names are never rewritten, and neither is an enum-like value (matching PROTOCOL_VALUE) in one of
+# its protocol fields, so a setting such as NEEDWING_INVITATION_CODE=code or =invitation_invalid
+# cannot erase the reason for a refusal. Free text (message, guidance) and nested data are redacted.
+ENVELOPE_KEYS = frozenset({"ok", "result", "error", "code", "status", "level", "kind", "action",
+                           "guidance", "message", "http_status", "next", "notice"})
+PROTOCOL_FIELDS = frozenset({"code", "status", "level", "kind", "action"})
+PROTOCOL_VALUE = re.compile(r"[a-zA-Z0-9_:-]{1,80}")
+
+
+def _secret_values(secrets_list):
+    found = {secret for secret in secrets_list or [] if isinstance(secret, str) and secret}
+    return sorted(found, key=len, reverse=True)
+
+
+def _redact_string(text, secrets, whole=True):
+    if whole and text in secrets:
+        return "[redacted]"
+    for secret in secrets:
+        if len(secret) >= SECRET_SUBSTRING_MIN:
             text = text.replace(secret, "[redacted]")
     return text
+
+
+def redact(text, secrets_list):
+    """Redaction of one printed text line (guidance, notices)."""
+    return _redact_string(text, _secret_values(secrets_list))
+
+
+def redact_data(value, secrets_list, _envelope=True):
+    """Redaction of a result or error before it is serialized, so the printed JSON always
+    parses. Keys and values alike: long secrets wherever they appear, short ones as whole
+    keys or values; the envelope's own field names and enum-like protocol values are kept
+    (ENVELOPE_KEYS). Keys that collide after redaction are all kept ("[redacted]",
+    "[redacted]#2", ...)."""
+    secrets = _secret_values(secrets_list)
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            own = _envelope and key in ENVELOPE_KEYS
+            name = key if own or not isinstance(key, str) else _redact_string(key, secrets)
+            if name in out:
+                suffix = 2
+                while f"{name}#{suffix}" in out:
+                    suffix += 1
+                name = f"{name}#{suffix}"
+            if own and key in PROTOCOL_FIELDS and isinstance(item, str) and PROTOCOL_VALUE.fullmatch(item):
+                out[name] = item
+            elif own and key in PROTOCOL_FIELDS and isinstance(item, str):
+                out[name] = _redact_string(item, secrets, whole=False)
+            else:
+                out[name] = redact_data(item, secrets, False)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [redact_data(item, secrets, False) for item in value]
+    if isinstance(value, str):
+        return _redact_string(value, secrets)
+    return value
 
 
 def program_name():
@@ -619,7 +737,8 @@ class Client:
 
     def secrets(self):
         """Credentials and saved request secrets that must never reach output."""
-        found = [os.environ.get("NEEDWING_API_KEY")]
+        invitation = os.environ.get("NEEDWING_INVITATION_CODE")
+        found = [os.environ.get("NEEDWING_API_KEY"), invitation, normalize_invitation_code(invitation)]
         tokens = self.tokens()
         if tokens is not None:
             for name in ("access_token", "refresh_token"):
@@ -798,6 +917,10 @@ class Client:
             code = detail.get("code", rfc_code or "http_error")
             if not isinstance(code, str) or not re.fullmatch(r"[a-zA-Z0-9_:-]{1,80}", code):
                 code = "http_error"
+            if path in ("/v4/auth/trial", "/v4/account/sign-up") and code in INVITATION_ERRORS:
+                status = 403 if path == "/v4/account/sign-up" and code == "invitation_required" else INVITATION_ERRORS[code][0]
+                if exc.code == status:
+                    raise invitation_error(code, self.base, http_status=exc.code) from None
             # Needwing attaches its download step to two different refusals. HTTP 426 says this
             # program is below the minimum (Needwing answers it before anything else, so a
             # client that got as far as another status is not), and invalid_target answers a
@@ -1003,6 +1126,12 @@ class Client:
                 if exc.payload.get("http_status") in (None, 429, 503) or exc.payload.get("code") in {"invalid_response", "upgrade_required"}:
                     raise
                 self.forget_connection()
+                if exc.payload.get("code") in INVITATION_ERRORS:
+                    # The replay needs an invitation (or the one supplied is unusable): the old pair stays
+                    # dropped, and the person sees the invitation result with how to reconnect.
+                    reconnect = self.reconnect_required(kind).payload["guidance"][0]
+                    exc.payload["guidance"] = list(exc.payload.get("guidance") or []) + [reconnect]
+                    raise exc from None
                 raise self.reconnect_required(kind) from None
             return
         self.forget_connection()
@@ -1121,7 +1250,7 @@ class Client:
 
     # ---- connection commands ----------------------------------------------
 
-    def connect(self, client_name=None):
+    def connect(self, client_name=None, *, invitation_code=None):
         """Reuse or recover one identity. Only demonstrably fresh state may create a trial."""
         if self.identity.get("login_requested") or self.identity.get("trial_sign_in") or self.identity.get("connection_paused"):
             raise self.pending_connection()
@@ -1132,12 +1261,12 @@ class Client:
                 raise ClientError("connection_pending", "Saved credentials are incomplete; state was retained. Recover the existing connection before continuing.")
             if (self.identity.get("connection_kind") in (None, "trial") and
                     "request_id" in self.identity and self.request_id_recoverable()):
-                self.register_trial(client_name or self.identity.get("client_name"))
+                self.register_trial(client_name or self.identity.get("client_name"), invitation_code=invitation_code)
             elif (set(self.identity) <= {"version", "base_url"} and
                   not self.last_path.exists() and not self.has_conversation_state() and
                   not any(self.tasks.iterdir()) and not any(self.providers.iterdir()) and
                   not any(self.tools.iterdir())):
-                self.register_trial(client_name)
+                self.register_trial(client_name, invitation_code=invitation_code)
             else:
                 raise ClientError("connection_pending", "The saved identity cannot be safely recovered automatically; no new trial was created.",
                                   guidance=["Keep this state directory and resolve the saved connection first. Do not launch login or create a replacement trial automatically."])
@@ -1160,7 +1289,7 @@ class Client:
             output["guidance"] += ["By continuing you agree to the Terms at " + self.base + "/terms."] + self.reply_check_guidance()
         return output
 
-    def start(self, client_name=None):
+    def start(self, client_name=None, *, invitation_code=None):
         if self.api_key():
             raise ClientError("named_key_active", "NEEDWING_API_KEY is set. Run " + cli("account") + " to check that connection.")
         if self.identity.get("trial_sign_in"):
@@ -1178,7 +1307,7 @@ class Client:
             return self.resume_trial()
         if client_name is None:
             client_name = self.identity.get("client_name")
-        result = self.register_trial(client_name)
+        result = self.register_trial(client_name, invitation_code=invitation_code)
         output, _ = self.with_next(result, [])
         output = {key: output[key] for key in ("trial_account_id", "level", "conversation_access", "trial_limits", "next") if key in output}
         output["guidance"] = [
@@ -1209,14 +1338,30 @@ class Client:
         ] + self.render_next(account.get("next")) + self.reply_check_guidance()
         return output
 
-    def register_trial(self, client_name=None):
-        """Create or replay the trial registration with the saved request_id; store the pair."""
+    def register_trial(self, client_name=None, *, invitation_code=None):
+        """Persist the request id before sending. Keep the invitation out of saved state."""
+        if client_name is not None and (not isinstance(client_name, str) or not CLIENT_NAME_PATTERN.fullmatch(client_name)):
+            raise ClientError("invalid_client_name", "Use a client name of letters, digits, spaces or . _ - (at most 80 characters).")
+        if invitation_code is None:
+            invitation_code = os.environ.get("NEEDWING_INVITATION_CODE")
+        invitation_code, malformed = supplied_invitation_code(invitation_code)
+        # A fresh registration cannot go ahead without a code; a replay of a saved request id can (the server ignores it).
+        if not (invitation_code or self.request_id_recoverable()):
+            raise invitation_error("invitation_invalid" if malformed else "invitation_required", self.base)
         body = {"request_id": self.ensure_request_id()}
         if client_name is not None:
-            if not isinstance(client_name, str) or not CLIENT_NAME_PATTERN.fullmatch(client_name):
-                raise ClientError("invalid_client_name", "Use a client name of letters, digits, spaces or . _ - (at most 80 characters).")
             body["client_name"] = client_name
-        result = self.call("POST", "/v4/auth/trial", body)
+        # Needwing ignores the code on a replay. Send it when supplied in case
+        # the server no longer recognizes the request id near the replay deadline.
+        if invitation_code:
+            body["invitation_code"] = invitation_code
+        try:
+            result = self.call("POST", "/v4/auth/trial", body)
+        except ClientError as exc:
+            refusal = malformed_invitation_refusal(exc, malformed, self.base)
+            if refusal is not None:
+                raise refusal from None
+            raise
         trial_id = result.get("trial_account_id")
         if not isinstance(trial_id, str) or not EXPECTED_ACCOUNT_PATTERN.fullmatch(trial_id):
             raise ClientError("invalid_response", "The trial response carried no usable trial_account_id; saved state was retained.")
@@ -1308,9 +1453,16 @@ class Client:
         body = {"email": email, "accept_terms": True, "terms_version": shown["version"]}
         if locale is not None:
             body["locale"] = locale
+        # A trial that already spent its invitation signs up without one, so a malformed code is left out, not refused.
+        invitation_code, malformed = supplied_invitation_code(os.environ.get("NEEDWING_INVITATION_CODE"))
+        if invitation_code:
+            body["invitation_code"] = invitation_code
         try:
             result = self.authorized("POST", "/v4/account/sign-up", body)
         except ClientError as exc:
+            refusal = malformed_invitation_refusal(exc, malformed, self.base)
+            if refusal is not None:
+                raise refusal from None
             if exc.payload.get("code") == "terms_outdated":
                 current = self.show_terms()
                 raise ClientError("terms_outdated",
@@ -1844,6 +1996,8 @@ class Client:
         """Local shape checks matching the published schema; Needwing stays authoritative."""
         if not isinstance(card, dict):
             raise ClientError("invalid_card", "The provider card must be one JSON object.")
+        if "visibility" in card:
+            raise ClientError("invalid_card", "visibility is no longer supported on provider cards; published cards are public.")
         unknown = sorted(set(card) - CARD_FIELDS)
         if unknown:
             raise ClientError("invalid_card", "Unknown provider card field: " + ", ".join(unknown))
@@ -1863,8 +2017,6 @@ class Client:
         window = card.get("reply_window_seconds")
         if not isinstance(window, int) or isinstance(window, bool) or not 60 <= window <= 86400:
             raise ClientError("invalid_card", "reply_window_seconds is 60..86400.")
-        if card.get("visibility") not in ("network", "private"):
-            raise ClientError("invalid_card", 'visibility is "network" (listed) or "private" (owner-only listing).')
         # Optional, and a boolean whenever it is present: Needwing refuses null, a string or a number here.
         if "accept_trial_contacts" in card and not isinstance(card["accept_trial_contacts"], bool):
             raise ClientError("invalid_card", "accept_trial_contacts is true or false (leave it out for the default).")
@@ -2088,7 +2240,7 @@ class Client:
 
     def pennets(self, view="search", query=None, pennet_id=None, publisher=None, sort=None, day=None,
                 lang=None, cursor=None, limit=None, confirm_account=None):
-        """Search, list or read public pennets (short public Markdown texts, including the daily AI News report); no model, no ledger."""
+        """Search, list or read public pennets (short public Markdown texts); no model, no ledger."""
         self.resolve_account_change(confirm_account)
         if view == "get":
             if not pennet_id:
@@ -3495,9 +3647,9 @@ def main(argv=None):
     parser.add_argument("--state-dir", default=default_state_dir(), help="Persistent private state directory (existing .needwing, otherwise the user's Needwing state directory)")
     parser.add_argument("--ca-file", help="Additional deployment CA bundle; TLS verification stays enabled")
     commands = parser.add_subparsers(dest="command", required=True)
-    connect = commands.add_parser("connect", help="Check or recover the saved connection; default to a trial only with fresh state")
+    connect = commands.add_parser("connect", help="Check or recover the saved connection; a new trial needs NEEDWING_INVITATION_CODE")
     connect.add_argument("--client-name", help="Short client label for a new trial registration")
-    start = commands.add_parser("start", help="Create or resume the anonymous trial account and store its token pair")
+    start = commands.add_parser("start", help="Resume a trial or create one with NEEDWING_INVITATION_CODE")
     start.add_argument("--client-name", help="Short client label recorded with the registration, e.g. Codex")
     commands.add_parser("account", help="Show the calling account's level, limits and next steps")
     signup = commands.add_parser("signup", help="Print the Terms/Privacy links, or start in-chat sign-up with --email and --accept-terms")
@@ -3545,7 +3697,7 @@ def main(argv=None):
     discover = commands.add_parser("discover", help="Read published supplies without contacting them")
     discover.add_argument("--request-file", required=True, help="UTF-8 natural request")
     confirm_option(discover)
-    pennets = commands.add_parser("pennets", help="Search, list or read public pennets (short texts, including the daily AI News report); trials included")
+    pennets = commands.add_parser("pennets", help="Search, list or read public pennets (short public Markdown texts); trials included")
     pennets.add_argument("--view", choices=["search", "list", "get"], default="search")
     pennets.add_argument("--query", help="Search words (view search)")
     pennets.add_argument("--pennet-id", help="One pennet to read (view get)")
@@ -3690,11 +3842,11 @@ def main(argv=None):
             else:
                 text = Path(args.request_file).read_text(encoding="utf-8") if args.request_file else args.request
                 result = client.run(text, args.wait_seconds, args.new_task, args.confirm_account)
-            print(redact(json.dumps(result, ensure_ascii=False, indent=2), client.secrets()))
+            print(json.dumps(redact_data(result, client.secrets()), ensure_ascii=False, indent=2))
             return 0
     except ClientError as exc:
         secrets_list = client.secrets() if client is not None else []
-        print(redact(json.dumps({"error": exc.payload}, ensure_ascii=False), secrets_list), file=sys.stderr)
+        print(json.dumps({"error": redact_data(exc.payload, secrets_list)}, ensure_ascii=False), file=sys.stderr)
         # A level refusal prints the server's next steps and the client's own command guidance together:
         # Needwing's `next` entries carry hints but no url, so neither list alone names the runnable commands.
         lines = list(exc.payload.get("guidance") or [])
