@@ -99,7 +99,7 @@ INVITATION_ERRORS = {
     "invitation_expired": (409, "This invitation has expired. Ask the person for a new Needwing invitation."),
     "invitation_revoked": (409, "This invitation has been revoked. Ask the person for a new Needwing invitation."),
 }
-CLIENT_VERSION = "2.2.2"  # Synced from the Needwing service contracts.
+CLIENT_VERSION = "2.4.0"  # Synced from the Needwing service contracts.
 VERSION_PATH = "/api/connect/version"
 CLIENT_PATH = "/api/connect/client.py"
 UPGRADE_REQUIRED_EXIT = 3
@@ -255,6 +255,9 @@ IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 # The value is a UUID — exactly the shape Needwing's check accepts (anything else is its 422 validation_failed).
 EXPECTED_ACCOUNT_HEADER = "Needwing-Expected-Account"
 EXPECTED_ACCOUNT_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Exact shape of Needwing's masked email hint: one leading character + "***@" + one domain char + "***" (+ optional suffix).
+MASKED_EMAIL_PATTERN = re.compile(r"^[^\s@]\*\*\*@[^\s.@]\*\*\*(?:\.[^\s.@]+)?$")
+TERMS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # authorized()'s default: derive the header value from the connection's confirmed account.
 DERIVED = object()
 A2A_CARD_FIELDS = ("card_url", "endpoint_challenge_id", "skill_id", "protocol_version")
@@ -919,7 +922,10 @@ class Client:
                 code = "http_error"
             if path in ("/v4/auth/trial", "/v4/account/sign-up") and code in INVITATION_ERRORS:
                 status = 403 if path == "/v4/account/sign-up" and code == "invitation_required" else INVITATION_ERRORS[code][0]
-                if exc.code == status:
+                has_sign_in = isinstance(next_steps, list) and any(
+                    isinstance(step, dict) and step.get("action") == "sign_in" for step in next_steps
+                )
+                if exc.code == status and not (code == "invitation_redeemed" and has_sign_in):
                     raise invitation_error(code, self.base, http_status=exc.code) from None
             # Needwing attaches its download step to two different refusals. HTTP 426 says this
             # program is below the minimum (Needwing answers it before anything else, so a
@@ -995,6 +1001,34 @@ class Client:
                         and details.get("scope") in {"account_day", "oauth_client_day", "run_account", "run_source", "run_global"})):
                 guidance = [DAILY_RESEARCH_REFUSAL]
             extras = {}
+            if isinstance(next_steps, list):
+                safe_next = []
+                for step in next_steps:
+                    if not isinstance(step, dict) or not isinstance(step.get("action"), str) or not isinstance(step.get("hint"), str):
+                        continue
+                    item = {"action": step["action"], "hint": step["hint"][:300]}
+                    safe_url = self.safe_next_url(step.get("url"))
+                    if safe_url:
+                        item["url"] = safe_url
+                    safe_next.append(item)
+                if safe_next:
+                    extras["next"] = safe_next
+            if isinstance(details, dict):
+                raw_hint = details.get("email_hint")
+                if isinstance(raw_hint, str) and MASKED_EMAIL_PATTERN.fullmatch(raw_hint.strip()):
+                    extras["email_hint"] = raw_hint.strip()
+                if code in {"terms_required", "terms_outdated"} and isinstance(details.get("terms"), dict):
+                    raw_terms = details["terms"]
+                    t_ver = raw_terms.get("version")
+                    t_url = self.safe_legal_url(raw_terms.get("terms_url"), "/terms")
+                    p_url = self.safe_legal_url(raw_terms.get("privacy_url"), "/privacy")
+                    if isinstance(t_ver, str) and TERMS_VERSION_PATTERN.fullmatch(t_ver) and t_url and p_url:
+                        extras["terms"] = {"version": t_ver, "terms_url": t_url, "privacy_url": p_url}
+            if code in {"invitation_email_registered", "invitation_redeemed", "trial_converted"} and exc.code == 409:
+                if code == "invitation_email_registered" or any(s.get("action") == "sign_in" for s in extras.get("next", [])):
+                    sign_in_hint = "Run: " + cli("login") + " (or ask the person to sign in at " + self.base + "/login)."
+                    if sign_in_hint not in guidance:
+                        guidance.append(sign_in_hint)
             if guidance:
                 extras["guidance"] = guidance
             if confirmed_inactive is not None:
@@ -1002,8 +1036,12 @@ class Client:
             if write and exc.code in (500, 502, 503, 504) and "guidance" not in extras:
                 # A gateway or server failure after the request left may follow an accepted write.
                 extras["guidance"] = list(UNCERTAIN_WRITE_GUIDANCE)
-            failure = ClientError(code, "Needwing rejected the request; the saved identity and submission were retained.",
-                                  http_status=exc.code, request_id=safe_id, **extras)
+            msg = {
+                "invitation_email_registered": "That address already has a Needwing account; sign in with an existing account instead of requesting a new invitation.",
+                "invitation_redeemed": "This invitation has already created a Needwing account; sign in with that account instead of requesting a new invitation." if any(s.get("action") == "sign_in" for s in extras.get("next", [])) else "Needwing rejected the request; the saved identity and submission were retained.",
+                "trial_converted": "This account setup has already converted or its recovery window expired; sign in with needwing login.",
+            }.get(code, "Needwing rejected the request; the saved identity and submission were retained.")
+            failure = ClientError(code, msg, http_status=exc.code, request_id=safe_id, **extras)
             # Local request context, never a server-supplied field: a refresh,
             # registration or status refusal says nothing about queue admission.
             failure.research_submission_refused = research_submission
@@ -1104,33 +1142,80 @@ class Client:
         # it was confirmed with is gone: no other credential may use it as its binding.
         self.identity.pop("account_connection", None)
         if not self.request_id_recoverable():
-            for key in ("request_id", "request_id_created_at", "trial_account_id"):
+            for key in ("request_id", "request_id_created_at", "trial_account_id", "enrollment_kind", "trial_terms_confirmation"):
                 self.identity.pop(key, None)
         write_private(self.identity_path, self.identity)
 
     def settle_refresh(self):
         """A refresh token marked in flight is never sent again (its outcome is unknown or it is spent).
 
-        A trial account inside the 24 hour replay window is recovered by replaying
-        the same registration (same account, fresh pair). Anything else is cleared
-        and the person reconnects."""
+        A trial or unverified bound-trial account inside the 24 hour replay window
+        is recovered by replaying the same registration (same account, fresh pair).
+        Device-login grants and moved connections never call /v4/auth/trial here."""
         if "refresh_in_flight" not in self.identity:
             return
         tokens = self.tokens()
-        kind = (tokens or {}).get("kind") or "trial"
-        if kind == "trial" and self.request_id_recoverable():
+        conn_kind = self.identity.get("connection_kind")
+        kind = (tokens or {}).get("kind") or conn_kind or "trial"
+        is_trial = ((tokens or {}).get("kind") == "trial" or conn_kind == "trial") and conn_kind != "account"
+        is_bound_trial = (
+            conn_kind == "account"
+            and self.identity.get("enrollment_kind") == "bound_trial"
+            and not self.identity.get("account_change_pending")
+        )
+        if is_bound_trial and self.request_id_recoverable():
+            expected_account = self.identity.get("account_id")
+            if not isinstance(expected_account, str) or not expected_account:
+                expected_account = None
             try:
-                self.register_trial(self.identity.get("client_name"))
+                self.recover_trial_registration(
+                    self.identity.get("client_name"),
+                    expected_level="limited",
+                    expected_account_id=expected_account,
+                )
             except ClientError as exc:
                 # transport trouble, quota or an unavailable service keep the marker: the replay is idempotent.
                 if exc.payload.get("http_status") in (None, 429, 503) or exc.payload.get("code") in {"invalid_response", "upgrade_required"}:
                     raise
                 self.forget_connection()
-                if exc.payload.get("code") in INVITATION_ERRORS:
+                if exc.payload.get("code") == "trial_converted":
+                    raise exc from None
+                if exc.payload.get("code") in INVITATION_ERRORS and not (
+                        exc.payload.get("code") == "invitation_redeemed" and any(
+                            isinstance(s, dict) and s.get("action") == "sign_in" for s in (exc.payload.get("next") or ()))):
+                    reconnect = self.reconnect_required(kind).payload["guidance"][0]
+                    exc.payload["guidance"] = list(exc.payload.get("guidance") or []) + [reconnect]
+                    raise exc from None
+                if exc.payload.get("code") in {"invitation_email_registered", "invitation_redeemed"}:
+                    raise exc from None
+                raise self.reconnect_required(kind) from None
+            return
+        if is_trial and self.request_id_recoverable():
+            expected_account = self.identity.get("trial_account_id") or self.identity.get("account_id")
+            if not isinstance(expected_account, str) or not expected_account:
+                expected_account = None
+            try:
+                self.recover_trial_registration(
+                    self.identity.get("client_name"),
+                    expected_level="trial",
+                    expected_account_id=expected_account,
+                )
+            except ClientError as exc:
+                # transport trouble, quota or an unavailable service keep the marker: the replay is idempotent.
+                if exc.payload.get("http_status") in (None, 429, 503) or exc.payload.get("code") in {"invalid_response", "upgrade_required"}:
+                    raise
+                self.forget_connection()
+                if exc.payload.get("code") == "trial_converted":
+                    raise exc from None
+                if exc.payload.get("code") in INVITATION_ERRORS and not (
+                        exc.payload.get("code") == "invitation_redeemed" and any(
+                            isinstance(s, dict) and s.get("action") == "sign_in" for s in (exc.payload.get("next") or ()))):
                     # The replay needs an invitation (or the one supplied is unusable): the old pair stays
                     # dropped, and the person sees the invitation result with how to reconnect.
                     reconnect = self.reconnect_required(kind).payload["guidance"][0]
                     exc.payload["guidance"] = list(exc.payload.get("guidance") or []) + [reconnect]
+                    raise exc from None
+                if exc.payload.get("code") in {"invitation_email_registered", "invitation_redeemed"}:
                     raise exc from None
                 raise self.reconnect_required(kind) from None
             return
@@ -1211,7 +1296,7 @@ class Client:
         """Only same-origin https URLs with a plain path are echoed back."""
         if not isinstance(value, str) or not value or len(value) > 2048:
             return None
-        if any(ord(c) < 0x20 or c.isspace() for c in value):
+        if "\\" in value or any(ord(c) < 0x20 or c.isspace() for c in value):
             return None
         try:
             parsed = parse.urlsplit(value)
@@ -1225,6 +1310,44 @@ class Client:
         if not re.fullmatch(r"/[A-Za-z0-9/_.-]{0,96}", parsed.path):
             return None
         return self.base + parsed.path + (("?" + parsed.query) if parsed.query else "")
+
+    def safe_legal_url(self, value, expected_path):
+        """Validate Terms/Privacy URLs strictly against this portal's origin and fixed legal path."""
+        if not isinstance(value, str) or not value or len(value) > 256:
+            return None
+        if "\\" in value or any(ord(c) < 0x20 or c.isspace() for c in value):
+            return None
+        if value.startswith("/"):
+            if value.startswith("//"):
+                return None
+            try:
+                parsed = parse.urlsplit("https://origin.invalid" + value)
+            except ValueError:
+                return None
+            if parsed.path != expected_path or parsed.query or parsed.fragment:
+                return None
+            return self.base + expected_path
+        try:
+            parsed = parse.urlsplit(value)
+        except ValueError:
+            return None
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or
+                parsed.password or parsed.query or parsed.fragment):
+            return None
+        if parsed.scheme + "://" + parsed.netloc != self.base or parsed.path != expected_path:
+            return None
+        return self.base + expected_path
+
+    def supports_auth_locale(self):
+        """Query GET /api/connect/version live (no positive cache) for features.bound_invitations === true."""
+        try:
+            answer = self.call("GET", VERSION_PATH)
+        except ClientError as exc:
+            if exc.payload.get("code") == "upgrade_required":
+                raise
+            return False
+        features = answer.get("features") if isinstance(answer, dict) else None
+        return isinstance(features, dict) and features.get("bound_invitations") is True
 
     def render_next(self, value):
         lines = []
@@ -1250,23 +1373,63 @@ class Client:
 
     # ---- connection commands ----------------------------------------------
 
-    def connect(self, client_name=None, *, invitation_code=None):
+    def connect(self, client_name=None, *, invitation_code=None, accept_terms=False, terms_version=None, locale=None):
         """Reuse or recover one identity. Only demonstrably fresh state may create a trial."""
         if self.identity.get("login_requested") or self.identity.get("trial_sign_in") or self.identity.get("connection_paused"):
             raise self.pending_connection()
         if self.tokens() is None and not self.api_key():
-            if self.identity.get("connection_kind") == "account":
+            can_recover_bound = (
+                self.identity.get("connection_kind") == "account"
+                and self.identity.get("enrollment_kind") == "bound_trial"
+                and not self.identity.get("account_change_pending")
+                and "tokens" not in self.identity and "refresh_in_flight" not in self.identity
+                and self.request_id_recoverable()
+            )
+            if can_recover_bound:
+                expected_account = self.identity.get("account_id") if isinstance(self.identity.get("account_id"), str) else None
+                self.recover_trial_registration(
+                    client_name or self.identity.get("client_name"),
+                    expected_level="limited",
+                    expected_account_id=expected_account,
+                )
+            elif self.identity.get("connection_kind") == "account":
                 raise self.reconnect_required("account")
-            if "tokens" in self.identity or "refresh_in_flight" in self.identity:
+            elif "tokens" in self.identity or "refresh_in_flight" in self.identity:
                 raise ClientError("connection_pending", "Saved credentials are incomplete; state was retained. Recover the existing connection before continuing.")
-            if (self.identity.get("connection_kind") in (None, "trial") and
+            elif ((self.identity.get("connection_kind") == "trial"
+                    or (self.identity.get("connection_kind") is None
+                        and (isinstance(self.identity.get("trial_account_id"), str)
+                             or isinstance(self.identity.get("account_id"), str))))
+                    and self.request_id_recoverable()):
+                expected_level = "trial" if (self.identity.get("connection_kind") == "trial" or isinstance(self.identity.get("trial_account_id"), str)) else None
+                expected_account = self.identity.get("trial_account_id") or self.identity.get("account_id")
+                if not isinstance(expected_account, str) or not expected_account:
+                    expected_account = None
+                self.recover_trial_registration(
+                    client_name or self.identity.get("client_name"),
+                    expected_level=expected_level,
+                    expected_account_id=expected_account,
+                )
+            elif (self.identity.get("connection_kind") is None and
                     "request_id" in self.identity and self.request_id_recoverable()):
-                self.register_trial(client_name or self.identity.get("client_name"), invitation_code=invitation_code)
-            elif (set(self.identity) <= {"version", "base_url"} and
+                self.register_trial(
+                    client_name or self.identity.get("client_name"),
+                    invitation_code=invitation_code,
+                    accept_terms=accept_terms,
+                    terms_version=terms_version,
+                    locale=locale,
+                )
+            elif (set(self.identity) <= {"version", "base_url", "trial_terms_confirmation"} and
                   not self.last_path.exists() and not self.has_conversation_state() and
                   not any(self.tasks.iterdir()) and not any(self.providers.iterdir()) and
                   not any(self.tools.iterdir())):
-                self.register_trial(client_name, invitation_code=invitation_code)
+                self.register_trial(
+                    client_name,
+                    invitation_code=invitation_code,
+                    accept_terms=accept_terms,
+                    terms_version=terms_version,
+                    locale=locale,
+                )
             else:
                 raise ClientError("connection_pending", "The saved identity cannot be safely recovered automatically; no new trial was created.",
                                   guidance=["Keep this state directory and resolve the saved connection first. Do not launch login or create a replacement trial automatically."])
@@ -1289,7 +1452,7 @@ class Client:
             output["guidance"] += ["By continuing you agree to the Terms at " + self.base + "/terms."] + self.reply_check_guidance()
         return output
 
-    def start(self, client_name=None, *, invitation_code=None):
+    def start(self, client_name=None, *, invitation_code=None, accept_terms=False, terms_version=None, locale=None):
         if self.api_key():
             raise ClientError("named_key_active", "NEEDWING_API_KEY is set. Run " + cli("account") + " to check that connection.")
         if self.identity.get("trial_sign_in"):
@@ -1307,8 +1470,21 @@ class Client:
             return self.resume_trial()
         if client_name is None:
             client_name = self.identity.get("client_name")
-        result = self.register_trial(client_name, invitation_code=invitation_code)
+        result = self.register_trial(
+            client_name,
+            invitation_code=invitation_code,
+            accept_terms=accept_terms,
+            terms_version=terms_version,
+            locale=locale,
+        )
         output, _ = self.with_next(result, [])
+        if result.get("level") == "limited":
+            output = {key: output[key] for key in ("account_id", "level", "email", "limits", "can", "next") if key in output}
+            output["guidance"] = [
+                "Limited account created with the confirmed email. By continuing you agree to the Terms at " + self.base + "/terms.",
+                "Publishing needs verified: ask the person to sign in once at " + self.base + "/login with the same email, then run " + cli("account") + ".",
+            ] + self.render_next(result.get("next")) + self.reply_check_guidance()
+            return output
         output = {key: output[key] for key in ("trial_account_id", "level", "conversation_access", "trial_limits", "next") if key in output}
         output["guidance"] = [
             "Trial ready for research within its limits. By continuing you agree to the Terms at " + self.base + "/terms.",
@@ -1338,35 +1514,51 @@ class Client:
         ] + self.render_next(account.get("next")) + self.reply_check_guidance()
         return output
 
-    def register_trial(self, client_name=None, *, invitation_code=None):
-        """Persist the request id before sending. Keep the invitation out of saved state."""
-        if client_name is not None and (not isinstance(client_name, str) or not CLIENT_NAME_PATTERN.fullmatch(client_name)):
-            raise ClientError("invalid_client_name", "Use a client name of letters, digits, spaces or . _ - (at most 80 characters).")
-        if invitation_code is None:
-            invitation_code = os.environ.get("NEEDWING_INVITATION_CODE")
-        invitation_code, malformed = supplied_invitation_code(invitation_code)
-        # A fresh registration cannot go ahead without a code; a replay of a saved request id can (the server ignores it).
-        if not (invitation_code or self.request_id_recoverable()):
-            raise invitation_error("invitation_invalid" if malformed else "invitation_required", self.base)
-        body = {"request_id": self.ensure_request_id()}
-        if client_name is not None:
-            body["client_name"] = client_name
-        # Needwing ignores the code on a replay. Send it when supplied in case
-        # the server no longer recognizes the request id near the replay deadline.
-        if invitation_code:
-            body["invitation_code"] = invitation_code
-        try:
-            result = self.call("POST", "/v4/auth/trial", body)
-        except ClientError as exc:
-            refusal = malformed_invitation_refusal(exc, malformed, self.base)
-            if refusal is not None:
-                raise refusal from None
-            raise
+    def _apply_trial_receipt(self, result, *, client_name=None, expected_level=None, expected_account_id=None):
+        """Validate a trial or Limited account receipt (tokens, level, account id) BEFORE any state mutation."""
+        if not isinstance(result, dict):
+            raise ClientError("invalid_response", "The trial response was not a JSON object; saved state was retained.")
+        level = result.get("level")
+        if expected_level == "limited" and level != "limited":
+            raise ClientError("invalid_response", "The recovery response did not match the expected Limited account level; saved state was retained.")
+        if expected_level == "trial" and level is not None and level != "trial":
+            raise ClientError("invalid_response", "The recovery response did not match the expected trial level; saved state was retained.")
+        if level is not None and level not in ("trial", "limited"):
+            raise ClientError("invalid_response", "The trial response carried an unsupported level; saved state was retained.")
+
+        token_pair = result.get("token")
+        if (not isinstance(token_pair, dict)
+                or not isinstance(token_pair.get("access_token"), str) or not token_pair["access_token"]
+                or not isinstance(token_pair.get("refresh_token"), str) or not token_pair["refresh_token"]):
+            raise ClientError("invalid_response", "The trial response carried no usable token pair; saved state was retained.")
+
+        if level == "limited":
+            account_id = result.get("account_id")
+            email = result.get("email")
+            if (not isinstance(account_id, str) or not EXPECTED_ACCOUNT_PATTERN.fullmatch(account_id) or not uuid_text(account_id)
+                    or not isinstance(email, str) or not email.strip()):
+                raise ClientError("invalid_response", "The Limited account response carried an invalid account_id or email; saved state was retained.")
+            if isinstance(expected_account_id, str) and expected_account_id and account_id.lower() != expected_account_id.lower():
+                raise ClientError("invalid_response", "The recovered Limited account_id does not match the saved account; saved state was retained.")
+            self.identity.pop("trial_terms_confirmation", None)
+            if client_name is not None:
+                self.identity["client_name"] = client_name
+            pending_move = bool(self.identity.get("account_change_pending"))
+            if pending_move:
+                self.save_tokens(token_pair, "account", bind_account=False)
+            else:
+                self.identity["connection_kind"] = "account"
+                self.identity["enrollment_kind"] = "bound_trial"
+                self.identity["account_id"] = account_id
+                self.save_tokens(token_pair, "account", bind_account=True)
+            return result
+
         trial_id = result.get("trial_account_id")
-        if not isinstance(trial_id, str) or not EXPECTED_ACCOUNT_PATTERN.fullmatch(trial_id):
+        if not isinstance(trial_id, str) or not EXPECTED_ACCOUNT_PATTERN.fullmatch(trial_id) or not uuid_text(trial_id):
             raise ClientError("invalid_response", "The trial response carried no usable trial_account_id; saved state was retained.")
-        if not isinstance(result.get("token"), dict):
-            raise ClientError("invalid_response", "The trial response carried no token pair; saved state was retained.")
+        if isinstance(expected_account_id, str) and expected_account_id and trial_id.lower() != expected_account_id.lower():
+            raise ClientError("invalid_response", "The recovered trial_account_id does not match the saved account; saved state was retained.")
+        self.identity.pop("trial_terms_confirmation", None)
         if client_name is not None:
             self.identity["client_name"] = client_name
         self.identity["trial_account_id"] = trial_id
@@ -1377,8 +1569,152 @@ class Client:
         # confirmed id. A pending move is never overwritten by the receipt.
         if not isinstance(self.identity.get("account_change_pending"), dict):
             self.identity["account_id"] = trial_id
-        self.save_tokens(result["token"], "trial", bind_account=True)  # also writes the identity and clears any refresh marker
+        self.save_tokens(token_pair, "trial", bind_account=True)  # also writes the identity and clears any refresh marker
         return result
+
+    def recover_trial_registration(self, client_name=None, *, expected_level=None, expected_account_id=None):
+        """Replay a saved 24h request_id to recover an existing trial or bound-trial account.
+
+        Never reads NEEDWING_INVITATION_CODE and never accepts fresh enrollment parameters."""
+        if client_name is not None and (not isinstance(client_name, str) or not CLIENT_NAME_PATTERN.fullmatch(client_name)):
+            raise ClientError("invalid_client_name", "Use a client name of letters, digits, spaces or . _ - (at most 80 characters).")
+        if not self.request_id_recoverable():
+            raise self.reconnect_required("account" if expected_level == "limited" else "trial")
+        req_id = self.identity.get("request_id")
+        body = {"request_id": req_id}
+        if client_name is not None:
+            body["client_name"] = client_name
+        try:
+            result = self.call("POST", "/v4/auth/trial", body)
+        except ClientError as exc:
+            if exc.payload.get("code") == "trial_converted":
+                for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                    self.identity.pop(k, None)
+                write_private(self.identity_path, self.identity)
+            raise
+        return self._apply_trial_receipt(
+            result,
+            client_name=client_name,
+            expected_level=expected_level,
+            expected_account_id=expected_account_id,
+        )
+
+    def register_trial(self, client_name=None, *, invitation_code=None, accept_terms=False, terms_version=None, locale=None, expected_level=None, expected_account_id=None):
+        """Persist the request id before sending. Keep any invitation code out of saved state."""
+        if client_name is not None and (not isinstance(client_name, str) or not CLIENT_NAME_PATTERN.fullmatch(client_name)):
+            raise ClientError("invalid_client_name", "Use a client name of letters, digits, spaces or . _ - (at most 80 characters).")
+        if locale is not None and locale not in ("zh", "en"):
+            raise ClientError("invalid_locale", "Use zh or en for --locale.")
+        if terms_version is not None and (not isinstance(terms_version, str) or not TERMS_VERSION_PATTERN.fullmatch(terms_version)):
+            raise ClientError("invalid_terms_version", "Provide a valid Terms version from Needwing.")
+        if invitation_code is None:
+            invitation_code = os.environ.get("NEEDWING_INVITATION_CODE")
+        invitation_code, malformed = supplied_invitation_code(invitation_code)
+        # A fresh registration cannot go ahead without a code; a replay of a saved request id can (the server ignores it).
+        if not (invitation_code or self.request_id_recoverable()):
+            raise invitation_error("invitation_invalid" if malformed else "invitation_required", self.base)
+        req_id = self.ensure_request_id()
+        confirmed_terms_version = None
+        if accept_terms:
+            if not invitation_code:
+                if "trial_terms_confirmation" in self.identity:
+                    self.identity.pop("trial_terms_confirmation", None)
+                    write_private(self.identity_path, self.identity)
+                raise ClientError("terms_required",
+                                  "Supply the invitation code through NEEDWING_INVITATION_CODE and show its email hint and legal links before confirming with --accept-terms.",
+                                  guidance=["Set NEEDWING_INVITATION_CODE to the invitation and run " + cli(self._command or "start") + " without --accept-terms first."])
+            code_sha = hashlib.sha256(invitation_code.encode("utf-8")).hexdigest()
+            pending_conf = self.identity.get("trial_terms_confirmation")
+            matches_conf = (
+                isinstance(pending_conf, dict)
+                and pending_conf.get("request_id") == req_id
+                and pending_conf.get("invitation_sha256") == code_sha
+                and isinstance(pending_conf.get("terms_version"), str)
+                and bool(pending_conf["terms_version"])
+                and (terms_version is None or pending_conf["terms_version"] == terms_version)
+            )
+            if not matches_conf:
+                self.identity.pop("trial_terms_confirmation", None)
+                write_private(self.identity_path, self.identity)
+                raise ClientError("terms_confirmation_invalidated",
+                                  "The saved Terms confirmation is missing, outdated, or belongs to a different invitation or request. Run without --accept-terms first so the person sees the current email hint and Terms links.",
+                                  guidance=["Run " + cli(self._command or "start") + " without --accept-terms to fetch the masked email and Terms links for this invitation, ask the person for an explicit yes, then pass --accept-terms."])
+            confirmed_terms_version = terms_version or pending_conf["terms_version"]
+        body = {"request_id": req_id}
+        if client_name is not None:
+            body["client_name"] = client_name
+        # Needwing ignores the code on a replay. Send it when supplied in case
+        # the server no longer recognizes the request id near the replay deadline.
+        if invitation_code:
+            body["invitation_code"] = invitation_code
+        if accept_terms:
+            body["accept_terms"] = True
+            body["terms_version"] = confirmed_terms_version
+        if locale is not None and self.supports_auth_locale():
+            body["locale"] = locale
+        try:
+            result = self.call("POST", "/v4/auth/trial", body)
+        except ClientError as exc:
+            err_code = exc.payload.get("code")
+            if err_code in {"terms_required", "terms_outdated"}:
+                terms_info = exc.payload.get("terms")
+                email_hint = exc.payload.get("email_hint")
+                terms_url = self.safe_legal_url(terms_info.get("terms_url"), "/terms") if isinstance(terms_info, dict) else None
+                privacy_url = self.safe_legal_url(terms_info.get("privacy_url"), "/privacy") if isinstance(terms_info, dict) else None
+                version_label = terms_info.get("version") if isinstance(terms_info, dict) else None
+                valid_version = isinstance(version_label, str) and bool(TERMS_VERSION_PATTERN.fullmatch(version_label))
+                valid_hint = isinstance(email_hint, str) and bool(MASKED_EMAIL_PATTERN.fullmatch(email_hint))
+                if not (valid_hint and valid_version and terms_url and privacy_url):
+                    self.identity.pop("trial_terms_confirmation", None)
+                    write_private(self.identity_path, self.identity)
+                    raise ClientError(
+                        "invalid_response",
+                        "Needwing rejected the request without a valid masked email hint and complete Terms metadata; saved state was retained.",
+                        http_status=exc.payload.get("http_status") or 400,
+                    ) from None
+                safe_terms = {"version": version_label, "terms_url": terms_url, "privacy_url": privacy_url}
+                if invitation_code:
+                    self.identity["trial_terms_confirmation"] = {
+                        "request_id": req_id,
+                        "invitation_sha256": hashlib.sha256(invitation_code.encode("utf-8")).hexdigest(),
+                        "email_hint": email_hint,
+                        "terms_version": version_label,
+                        "terms_url": terms_url,
+                        "privacy_url": privacy_url,
+                        "shown_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                else:
+                    self.identity.pop("trial_terms_confirmation", None)
+                write_private(self.identity_path, self.identity)
+                msg = ("The Terms changed after they were shown to the person, so nothing was created." if err_code == "terms_outdated"
+                       else "This invitation creates a Limited account for its bound email and needs the person's explicit Terms confirmation first.")
+                raise ClientError(
+                    err_code,
+                    msg,
+                    http_status=exc.payload.get("http_status") or 400,
+                    email_hint=email_hint,
+                    terms=safe_terms,
+                    guidance=[
+                        "Show the person the masked email (" + email_hint + "), Terms (" + terms_url + "), Privacy (" + privacy_url + "), version " + version_label + " — never accept for them.",
+                        "Only after the person's explicit yes, run: " + cli((self._command or "start") + " --accept-terms --terms-version " + version_label),
+                    ],
+                ) from None
+            if err_code == "trial_converted":
+                for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                    self.identity.pop(k, None)
+                write_private(self.identity_path, self.identity)
+                raise
+            refusal = malformed_invitation_refusal(exc, malformed, self.base)
+            if refusal is not None:
+                raise refusal from None
+            raise
+
+        return self._apply_trial_receipt(
+            result,
+            client_name=client_name,
+            expected_level=expected_level,
+            expected_account_id=expected_account_id,
+        )
 
     def terms(self):
         return self.call("GET", "/v4/account/terms")
@@ -1511,6 +1847,8 @@ class Client:
             # depends on it: run() re-reads the identity at its send point, so a lost
             # response or a later restart still binds every draft before any send.
             self.identity["connection_kind"] = "account"
+            for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                self.identity.pop(k, None)
             if isinstance(self.identity.get("tokens"), dict):
                 self.identity["tokens"]["kind"] = "account"
             self.bind_account(account_id)
@@ -1534,9 +1872,10 @@ class Client:
     @staticmethod
     def reply_check_guidance():
         return [
-            "Offer an optional hourly Needwing reply check using the host scheduler. Reuse a matching routine and remember a decline.",
+            "Offer an optional Needwing match and reply check every 2 hours, or at an interval or local time the person chooses, using the host scheduler. Reuse a matching routine, preserve its chosen cadence and remember a decline.",
             "Bind the routine to this state directory and the account id from " + cli("account") + ". Every run checks that id before reading replies or tracked research. If it differs or cannot be verified, stop and tell the person.",
-            "The check is read-only and notifies only for new information. This offer has not scheduled a task.",
+            "Read posted Needs with inbox --lane need_requester and need-read; keep their positions separate from conversation replies. A final research result is not an ongoing matching request. The check never creates, renews or retries requests.",
+            "The check is read-only and notifies only for new information. This offer has not scheduled a task; promise later notifications only after the host confirms an enabled check or a verified wake route.",
         ]
 
     def login_output(self, scope, trial_closed=False, account=None):
@@ -1549,14 +1888,14 @@ class Client:
                    if trial_closed else "Signed in through the person's account.")
         guidance = [message]
         output = {"status": "approved", "kind": "account", "scope": scope,
-                  "reply_polling": {"status": "pending_account_check", "interval_seconds": 3600,
+                  "reply_polling": {"status": "pending_account_check", "interval_seconds": 7200,
                                     "requires_confirmation": True, "read_only": True}}
         if trial_closed:
             account = account if isinstance(account, dict) else {}
             output["account_confirmation"] = "pending"
             output["account"] = {name: account[name] for name in ("account_id", "level", "email") if name in account}
             guidance += [
-                "The move waits for the person's yes: nothing is sent and no results are fetched until they confirm this account.",
+                "This client waits for the person's confirmation before further calls. The backend may already have resumed previously confirmed trial proposals under the account approved in the browser. Unconfirmed drafts are not published.",
                 "Tell the person which account approved (its email and level are shown), ask whether to keep using this connection under it, and only on their yes continue with " +
                 self.confirm_account_command() + " naming its account id. " + cli("account") + " shows it again.",
             ]
@@ -1641,6 +1980,8 @@ class Client:
                     self.identity.pop("account_connection", None)
                 self.identity.pop("trial_sign_in", None)
                 self.identity.pop("login_requested", None)
+                for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                    self.identity.pop(k, None)
                 # The server caps the moved credential to these two scopes.
                 tokens = self.tokens()
                 scope = " ".join(part for part in tokens.get("scope", "").split() if part in {"research", "engage"})
@@ -1650,12 +1991,16 @@ class Client:
             if account["level"] != "trial" or account_id.lower() != trial_id.lower():
                 self.identity.pop("trial_sign_in", None)
                 self.identity.pop("login_requested", None)
+                for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                    self.identity.pop(k, None)
                 write_private(self.identity_path, self.identity)
                 raise ClientError("sign_in_unavailable", "The trial changed before sign-in could be confirmed. Run " + cli("account") + ".")
             remaining = pending["expires_at"] - time.time()
             if remaining <= 0:
                 self.identity.pop("trial_sign_in", None)
                 self.identity.pop("login_requested", None)
+                for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                    self.identity.pop(k, None)
                 write_private(self.identity_path, self.identity)
                 raise ClientError("approval_not_confirmed", "No approval was confirmed before the code expired. Ask the person before starting again.")
             time.sleep(min(pending["interval"], remaining))
@@ -1727,6 +2072,8 @@ class Client:
             self.identity.pop("account_connection", None)
             self.identity.pop("account_change_pending", None)
             self.identity.pop("trial_sign_in", None)
+            for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
+                self.identity.pop(k, None)
             self.save_tokens(result, "account")
             return self.login_output(result.get("scope", ""))
 
@@ -1967,8 +2314,8 @@ class Client:
                               guidance=["Register the draft card first: " + cli("provider register --file card.json")])
         return self.identifier(provider_id, "provider_id")
 
-    def probe_ids(self, conversation_id):
-        """Find the saved provider id and probe id of one probe conversation (the confirm route nests under both)."""
+    def provider_for_probe(self, conversation_id):
+        """Find the provider that owns this saved probe conversation."""
         for candidate in self.providers.glob("*.json"):
             try:
                 record = read_private(candidate)
@@ -1977,7 +2324,7 @@ class Client:
             for state in (record.get("revisions") or {}).values():
                 if isinstance(state, dict) and isinstance(state.get("probe"), dict) and \
                         state["probe"].get("conversation_id") == conversation_id:
-                    return self.provider_id_of(record), self.identifier(state["probe"].get("probe_id"), "probe_id")
+                    return self.provider_id_of(record)
         raise ClientError("no_probe", "No saved probe for that conversation in this state directory.",
                           guidance=["Start the channel proof first: " + cli("provider probe")])
 
@@ -2115,9 +2462,9 @@ class Client:
         if conversation_id is None:
             conversation_id = (self.provider_identity() or {}).get("conversation_id")
         conversation_id = self.identifier(conversation_id, "conversation_id")
-        provider_id, probe_id = self.probe_ids(conversation_id)
+        provider_id = self.provider_for_probe(conversation_id)
         try:
-            result = self.authorized("POST", "/v4/providers/" + provider_id + "/probes/" + probe_id + "/confirm", {})
+            result = self.authorized("POST", "/v4/providers/" + provider_id + "/probes/" + conversation_id + "/confirm", {})
         except ClientError as exc:
             if exc.payload.get("code") == "trial_not_answered":
                 exc.payload["guidance"] = [
@@ -2237,6 +2584,178 @@ class Client:
         result = self.authorized("POST", "/v4/services/discover", {"description": description, "limit": 20})
         write_private(self.state / "discovery.json", result)
         return result
+
+    def need(self, body, confirm_account=None):
+        """Persist a Need body before sending; audience suppliers publishes, while omitted audience or only_me stays private."""
+        self.resolve_account_change(confirm_account)
+        allowed = {"request_id", "description", "keywords", "audience", "approved_in_chat"}
+        if not isinstance(body, dict) or set(body) - allowed:
+            raise ClientError("invalid_need", "Use request_id, description, keywords, documented visibility fields.")
+        request_id, description, keywords = body.get("request_id"), body.get("description"), body.get("keywords")
+        if (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id)
+                or not isinstance(description, str) or not description.strip() or len(description) > 500
+                or not isinstance(keywords, list) or len(keywords) > 16
+                or any(not isinstance(word, str) or not word.strip() or len(word) > 64 for word in keywords)
+                or len(set(keywords)) != len(keywords)
+                or body.get("audience", "only_me") not in ("only_me", "suppliers")
+                or ("approved_in_chat" in body and not isinstance(body["approved_in_chat"], bool))):
+            raise ClientError("invalid_need", "Use a stable request_id, a nonblank description up to 500 characters and up to 16 unique keywords.")
+        account, connection = self.active_account(), self.connection_id()
+        folder = self.state / "needs"
+        private_dir(folder)
+        path = folder / (hashlib.sha256(request_id.encode("utf-8")).hexdigest() + ".json")
+        saved = read_private(path) if path.exists() else None
+        if saved is not None:
+            if not isinstance(saved, dict) or saved.get("body") != body:
+                raise ClientError("need_request_changed", "The saved request_id belongs to a different body. Reconcile that Need before editing or submitting another.")
+            if saved.get("account_id") != account:
+                raise ClientError("need_account_changed", "This Need belongs to another account. Keep its draft and original connection; do not replay it here.")
+            receipt = saved.get("receipt")
+            if isinstance(receipt, dict) and isinstance(receipt.get("need"), dict):
+                return self.need_read(receipt["need"].get("id"))
+            if saved.get("connection_id") != connection:
+                raise ClientError("need_connection_changed", "The uncertain Need was sent on another connection. Read existing Needs to reconcile it before any new submission.")
+        else:
+            saved = {"account_id": account, "connection_id": connection, "body": body}
+            write_private(path, saved)
+        result = self.authorized("POST", "/v4/needs", saved["body"])
+        need = result.get("need") if isinstance(result, dict) else None
+        if (not isinstance(need, dict) or not isinstance(need.get("id"), str)
+                or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", need["id"])
+                or need.get("audience") not in ("only_me", "suppliers")
+                or need.get("state") not in ("open", "closed")
+                or not isinstance(need.get("expires_at"), str)):
+            raise uncertain_write("invalid_receipt", "No usable Need receipt; keep the saved body and request_id to reconcile this submission.")
+        saved["receipt"] = result
+        write_private(path, saved)
+        return result
+
+    def needs(self, confirm_account=None):
+        self.resolve_account_change(confirm_account)
+        return self.authorized("GET", "/v4/needs")
+
+    def need_read(self, need_id, confirm_account=None):
+        self.resolve_account_change(confirm_account)
+        result = self.authorized("GET", "/v4/needs/" + self.identifier(need_id, "need_id"))
+        if not isinstance(result, dict):
+            return result
+        need = result.get("need", {})
+        responses = result.get("responses")
+        if (isinstance(need, dict) and need.get("id") == need_id
+                and need.get("state") in {"open", "closed"} and isinstance(responses, list)):
+            if need["state"] == "closed":
+                state, message = "closed", "Continued matching has stopped. Do not present earlier candidates as current."
+            elif need.get("audience") == "only_me":
+                state, message = "unpublished", "This revision is not public. Review it at " + self.base + "/needs/" + need["id"] + ". Post it there to resume matching; this revision is not matching yet."
+            elif responses:
+                state, message = "responses_received", "There are current supplier responses. Read them before summarizing; an earlier research not_found is historical only."
+            else:
+                state, message = "searching", "Continued matching is active. This read has no supplier responses yet; this is not a failed submission."
+            current = {"state": state, "need_id": need_id,
+                       "supplier_response_count": len(responses) if need["state"] == "open" and need.get("audience") != "only_me" else 0, "message": message}
+            return {"current_matching": current, **{k: v for k, v in result.items() if k != "current_matching"}}
+        return result
+
+    def current_continuation(self, continued):
+        """A bounded live read after conversion, with no re-submission or acknowledgement."""
+        # Receipt snapshots are historical. Never keep stale candidates when a refresh fails.
+        continued = {k: v for k, v in continued.items() if k not in {"current_matching", "responses"}}
+        need = continued.get("need", {})
+        if continued.get("state") == "created" and isinstance(need, dict) and uuid_text(need.get("id")):
+            current = {"state": "unknown", "need_id": need["id"], "message": "The Need exists, but current matches could not be verified. Do not report no matches or reuse an earlier candidate count."}
+            try:
+                detail = self.need_read(need["id"])
+                if isinstance(detail, dict) and isinstance(detail.get("current_matching"), dict):
+                    return {"current_matching": detail["current_matching"], **continued, "need": detail["need"],
+                            "responses": detail["responses"]}
+            except ClientError as error:
+                current["read_error"] = error.payload.get("code", "read_failed")
+            return {**continued, "current_matching": current}
+        messages = {"awaiting_confirmation": "Research is complete; no public Need exists yet. For an aligned request with publication intent, show the summary and announce publishing, then call publish separately. Ask first when intent is unclear.",
+                    "awaiting_account": "Matching draft saved; sign in to publish and check current candidates.",
+                    "pending": "Matching draft saved; creation is pending, not yet published.",
+                    "cancelled": "Continued matching has stopped.", "blocked": "Continued matching could not start; explain the actual refusal."}
+        state = continued.get("state")
+        return {"current_matching": {"state": state, "message": messages.get(state, "Read the current Need before describing matches.")}, **continued}
+
+    def need_update(self, need_id, body, confirm_account=None):
+        """A revision-fenced update; retain the exact submitted body across uncertainty."""
+        self.resolve_account_change(confirm_account)
+        need_id = self.identifier(need_id, "need_id")
+        required = {"description", "keywords", "text_revision", "lifecycle_epoch"}
+        if not isinstance(body, dict) or not required <= set(body) or set(body) - required:
+            raise ClientError("invalid_need", "Read the Need first; use its current revision with the complete description, keywords.")
+        if (not isinstance(body["text_revision"], int) or isinstance(body["text_revision"], bool) or body["text_revision"] < 1
+                or not isinstance(body["lifecycle_epoch"], str) or not re.fullmatch(r"[1-9][0-9]{0,18}", body["lifecycle_epoch"])):
+            raise ClientError("invalid_need", "Use the exact integer text revision and decimal-string lifecycle epoch returned by the server.")
+        account, connection = self.active_account(), self.connection_id()
+        digest = hashlib.sha256(json.dumps([account, need_id, body], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        folder = self.state / "need-updates"
+        private_dir(folder)
+        path = folder / (digest + ".json")
+        saved = read_private(path) if path.exists() else {"account_id": account, "connection_id": connection, "need_id": need_id, "body": body}
+        if saved.get("account_id") != account or saved.get("connection_id") != connection or saved.get("body") != body:
+            raise ClientError("state_conflict", "Keep this Need update on its original account and connection.")
+        if saved.get("receipt"):
+            return self.need_update_view(self.need_read(need_id))
+        if saved.get("dispatched"):
+            current = self.need_read(need_id)
+            need = current.get("need", {})
+            if (need.get("text_revision") == body["text_revision"] + 1
+                    and need.get("description") == body["description"] and need.get("keywords") == body["keywords"]):
+                saved["receipt"] = current
+                write_private(path, saved)
+                return self.need_update_view(current)
+            raise uncertain_write("need_update_uncertain", "Read the current Need and reconcile the saved update; no replacement was sent.")
+        saved["dispatched"] = True
+        write_private(path, saved)
+        result = self.authorized("PATCH", "/v4/needs/" + need_id, saved["body"])
+        if not isinstance(result.get("need"), dict) or result["need"].get("id") != need_id:
+            raise uncertain_write("invalid_receipt", "The Need update returned no usable receipt. Keep the saved revision and read the Need.")
+        saved["receipt"] = result
+        write_private(path, saved)
+        return self.need_update_view(result)
+
+    def need_update_view(self, result):
+        """Guide reposting only for a revision the server confirms is hidden."""
+        need = result.get("need", {}) if isinstance(result, dict) else {}
+        if not isinstance(need, dict) or need.get("state") != "open" or need.get("audience") != "only_me":
+            return result
+        need_id = self.identifier(need.get("id"), "need_id")
+        url = self.base + "/needs/" + need_id
+        return {**result, "next": result.get("next") or [
+                    {"action": "review_need", "url": url,
+                     "hint": "Review this edited revision on the website and explicitly Post it to resume matching."}],
+                "current_matching": {"state": "unpublished", "need_id": need_id,
+                    "message": "This edited revision is hidden. Review it at " + url + ". Post it there to resume matching."}}
+
+    def research_need(self, session_id, action="resume", confirm_account=None, expected_run_id=None):
+        self.resolve_account_change(confirm_account)
+        session_id = self.identifier(session_id, "session_id")
+        if action not in ("publish", "resume", "cancel"):
+            raise ClientError("invalid_action", "Use publish, resume or cancel.")
+        body = {"session_id": session_id, "action": action}
+        if action == "publish":
+            body["expected_run_id"] = self.identifier(expected_run_id, "expected_run_id")
+        result = self.authorized("POST", "/v4/needs/research", body)
+        if not isinstance(result, dict) or result.get("session_id") != session_id or result.get("state") not in {"pending", "awaiting_confirmation", "awaiting_account", "created", "cancelled", "blocked"}:
+            raise ClientError("invalid_response", "The conversion receipt is invalid. Keep the session id and retry the same action.")
+        private_dir(self.state / "research-needs")
+        # Retain the accepted receipt even if the additional read fails.
+        write_private(self.state / "research-needs" / (session_id + ".json"), result)
+        result = self.current_continuation(result)
+        write_private(self.state / "research-needs" / (session_id + ".json"), result)
+        return result
+
+    def need_cancel(self, need_id, confirm_account=None):
+        current = self.need_read(need_id, confirm_account)
+        need = current.get("need", {})
+        if need.get("state") == "closed":
+            return current
+        if not isinstance(need.get("text_revision"), int) or not isinstance(need.get("lifecycle_epoch"), str):
+            raise ClientError("invalid_response", "Read the current Need revision before cancellation.")
+        return self.authorized("POST", "/v4/needs/" + self.identifier(need_id, "need_id") + "/close",
+                               {"text_revision": need["text_revision"], "lifecycle_epoch": need["lifecycle_epoch"], "reason": "stopped"})
 
     def pennets(self, view="search", query=None, pennet_id=None, publisher=None, sort=None, day=None,
                 lang=None, cursor=None, limit=None, confirm_account=None):
@@ -2939,10 +3458,46 @@ class Client:
             raise ClientError("invalid_provider", "Use the provider_external_id you registered (letters, digits and . _ : @ -, at most 128 characters).")
         return provider
 
-    def inbox(self, wait_seconds=0, confirm_account=None, provider=None):
+    @staticmethod
+    def need_position(pos):
+        return isinstance(pos, str) and re.fullmatch(r"0|[1-9][0-9]{0,18}", pos) is not None and int(pos) <= 9223372036854775807
+
+    def need_inbox_path(self, lane):
+        binding = [self.active_account(), self.connection_id(), lane]
+        return self.state / ("inbox-need-" + hashlib.sha256(json.dumps(binding).encode("utf-8")).hexdigest() + ".json")
+
+    def inbox(self, wait_seconds=0, confirm_account=None, provider=None, lane=None, cursor=None):
         """Read the initiator inbox, or with `provider` the mailbox of that Agent of this account. Reading never acknowledges."""
         provider = self.provider_selector(provider)
         self.resolve_account_change(confirm_account)
+        if lane is not None:
+            if lane not in {"need_requester", "need_supplier"} or provider is not None:
+                raise ClientError("invalid_lane", "Select one Need lane without a provider mailbox.")
+            if cursor is not None and (not isinstance(cursor, dict) or set(cursor) - {lane}
+                                       or any(not self.need_position(pos) for pos in cursor.values())):
+                raise ClientError("invalid_cursor", "Use this Need lane's next_cursor map with decimal-string positions.")
+            path = self.need_inbox_path(lane)
+            query = {"lane": lane, "limit": 100, "wait_ms": max(0, min(wait_seconds, 25)) * 1000}
+            if cursor is not None:
+                query["cursor"] = json.dumps(cursor, separators=(",", ":"))
+            result = self.authorized("GET", "/v4/inbox?" + parse.urlencode(query))
+            news = result.get("need_news") if isinstance(result, dict) else None
+            if not isinstance(news, dict) or not isinstance(news.get("items"), list):
+                raise ClientError("invalid_response", "Need news was not returned; this is not evidence of no new matches.")
+            saved = read_private(path) if path.exists() else {"items": []}
+            if not isinstance(saved, dict) or not isinstance(saved.get("items"), list):
+                raise ClientError("invalid_state", "The saved Need inbox is invalid; nothing was acknowledged.")
+            items = {}
+            for item in saved["items"] + news["items"]:
+                if not isinstance(item, dict) or item.get("lane") != lane or not self.need_position(item.get("pos")):
+                    raise ClientError("invalid_response", "The Need inbox carried an invalid lane or position; nothing was acknowledged.")
+                items[item["pos"]] = item
+            saved = {"items": sorted(items.values(), key=lambda item: int(item["pos"])), "latest_page": result}
+            write_private(path, saved)
+            # Downloading a page is not processing it. Keep unacknowledged pointers across restarts.
+            return {**result, "saved_unacknowledged_items": saved["items"]}
+        if cursor is not None:
+            raise ClientError("invalid_cursor", "A Need cursor requires --lane.")
         query = {"from": "bookmark", "wait_ms": max(0, min(wait_seconds, 25)) * 1000, "limit": 100}
         if provider is not None:
             query["provider_external_id"] = provider
@@ -2952,7 +3507,24 @@ class Client:
         write_private(self.state / name, result)
         return result
 
-    def ack(self, pos, confirm_account=None, provider=None):
+    def ack(self, pos, confirm_account=None, provider=None, lane=None):
+        if lane is not None:
+            self.resolve_account_change(confirm_account)
+            if lane not in {"need_requester", "need_supplier"} or provider is not None or not self.need_position(pos):
+                raise ClientError("invalid_position", "Use one Need lane and its exact decimal-string position, without a provider mailbox.")
+            path = self.need_inbox_path(lane)
+            saved = read_private(path) if path.exists() else {"items": []}
+            if not isinstance(saved, dict) or not isinstance(saved.get("items"), list):
+                raise ClientError("invalid_state", "The saved Need inbox is invalid; nothing was acknowledged.")
+            if not any(isinstance(item, dict) and item.get("pos") == pos for item in saved["items"]):
+                raise ClientError("position_not_saved", "Read and save this Need position before acknowledging it; process earlier saved items first.")
+            result = self.authorized("POST", "/v4/inbox/ack", {"lane": lane, "pos": pos})
+            if not isinstance(result, dict) or result.get("lane") != lane or not self.need_position(result.get("pos")):
+                raise uncertain_write("invalid_receipt", "The Need acknowledgement carried no valid lane position; local news was retained.")
+            processed = min(int(pos), int(result["pos"]))
+            saved["items"] = [item for item in saved["items"] if int(item["pos"]) > processed]
+            write_private(path, saved)
+            return result
         if not isinstance(pos, int) or pos < 0:
             raise ClientError("invalid_position", "Use a non-negative inbox position returned by Needwing.")
         provider = self.provider_selector(provider)
@@ -2989,18 +3561,31 @@ class Client:
         write_private(path, record)
         return result
 
-    def prepare(self, text, new_task=False):
+    def prepare(self, text, new_task=False, ongoing_need=None):
         if not text.strip() or len(text.encode("utf-16-le")) // 2 > 20000:
             raise ClientError("invalid_request", "Provide a nonblank request of at most 20,000 UTF-16 units.")
+        if ongoing_need is not None:
+            if (not isinstance(ongoing_need, dict) or not {"description", "keywords"} <= set(ongoing_need)
+                    or set(ongoing_need) - {"description", "keywords"}
+                    or not isinstance(ongoing_need["description"], str) or not ongoing_need["description"].strip()
+                    or len(ongoing_need["description"]) > 500 or not isinstance(ongoing_need["keywords"], list)
+                    or len(ongoing_need["keywords"]) > 16
+                    or any(not isinstance(k, str) or not k.strip() or len(k) > 64 for k in ongoing_need["keywords"])
+                    or len(set(ongoing_need["keywords"])) != len(ongoing_need["keywords"])):
+                raise ClientError("invalid_need", "Use an aligned public summary (up to 500 characters) and up to 16 unique keywords.")
         request_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         index_path = self.tasks / (request_hash + ".json")
         if index_path.exists() and not new_task:
             record = read_private(index_path)
             if record.get("body", {}).get("task", {}).get("request") != text:
                 raise ClientError("state_conflict", "Saved request differs; state was not overwritten.")
+            if ongoing_need is not None and record.get("body", {}).get("task", {}).get("ongoing_need") != ongoing_need:
+                raise ClientError("state_conflict", "This request already has a different publication intent. Keep its receipt; do not silently republish it.")
             return index_path, record
         submission_id = "needwing-" + str(uuid.uuid4())
         record = {"draft_version": 3, "body": {"client_submission_id": submission_id, "task": {"request": text}}}
+        if ongoing_need is not None:
+            record["body"]["task"]["ongoing_need"] = ongoing_need
         known_account = self.identity.get("account_id")
         if isinstance(known_account, str) and EXPECTED_ACCOUNT_PATTERN.fullmatch(known_account):
             # Bind a draft created under a confirmed account to that account, so a later
@@ -3193,8 +3778,8 @@ class Client:
         write_private(self.identity_path, self.identity)
         return current
 
-    def run(self, text, wait_seconds=120, new_task=False, confirm_account=None):
-        path, record = self.prepare(text, new_task)
+    def run(self, text, wait_seconds=120, new_task=False, confirm_account=None, ongoing_need=None):
+        path, record = self.prepare(text, new_task, ongoing_need)
         write_private(self.last_path, {"record": path.name})
         if "receipt" not in record:
             # Every draft-local refusal comes BEFORE the pending-move confirmation
@@ -3577,6 +4162,13 @@ class Client:
                   "final": run.get("final", isinstance(run.get("status"), str) and run.get("status") in TERMINAL),
                   "state_version": session.get("state_version"), "outcome": run.get("outcome"),
                   "clarifications": session.get("clarifications", []), "evidence": evidence}
+        if isinstance(session.get("ongoing_need"), dict):
+            continued = self.current_continuation(session["ongoing_need"])
+            output["ongoing_need"] = continued
+            output = {"current_matching": continued["current_matching"], "ongoing_need": continued,
+                      "research_context": "The outcome below describes the earlier research stage, not current matching. Lead with current_matching; do not repeat historical not_found as the latest result.", **output}
+            private_dir(self.state / "research-needs")
+            write_private(self.state / "research-needs" / (receipt["session_id"] + ".json"), continued)
         hints = self.recovery_hints(run.get("status"), run.get("outcome"))
         queue = run.get("queue")
         if run.get("status") == "queued" and isinstance(queue, dict):
@@ -3588,6 +4180,17 @@ class Client:
                 output["queue"] = {"active_limit": limit, "position": position, "reason": queue["reason"]}
                 if queue["reason"] == "account_concurrency_limit":
                     hints = ["You can run up to %d requests at a time. This request is queued and will start when capacity becomes available." % limit]
+        continued = output.get("ongoing_need")
+        if isinstance(continued, dict):
+            state = continued.get("state")
+            hints = {
+                "awaiting_confirmation": ["Research is read-only; no public Need has been posted. For an aligned matching request with publication intent, show its summary and announce continued matching, then use research-need --action publish with this session id and the displayed run_id as --expected-run-id. Ask first if publication intent is unclear; browsing alone never authorizes publication. Offer cancellation."],
+                "awaiting_account": ["The confirmed matching draft is saved, not published. Sign in on this connection; the backend resumes it after approval. Then read/resume with research-need --session-id " + receipt["session_id"] + ". Do not resubmit research. Offer cancellation of the saved request."],
+                "pending": ["Continued matching is pending; read or resume the same session. Do not claim a Need was created yet."],
+                "created": [continued["current_matching"]["message"], "Present current matching first. Mention earlier research only when useful and explicitly as history. Offer a two-hour/custom update check or cancellation; never submit another Need for this result."],
+                "cancelled": ["Continued matching was cancelled. Stop checks for this request and never recreate it by polling or retrying."],
+                "blocked": ["Continued matching was not started. Explain the actual refusal and keep the draft; do not claim it is queued or published."],
+            }.get(state, hints)
         if hints:
             output["guidance"] = hints
         write_private(self.state / "result.json", output)
@@ -3635,7 +4238,7 @@ def confirm_option(subparser):
 # Exactly the commands wired with confirm_option above (provider ones as "provider <sub>"):
 # guidance may name any of these with --confirm-account, and no other command.
 CONFIRM_COMMANDS = frozenset({
-    "run", "status", "diagnose", "followup", "discover", "pennets", "web-search", "web-read", "helper", "contact", "send",
+    "run", "status", "diagnose", "followup", "discover", "need", "needs", "need-read", "need-update", "research-need", "need-cancel", "pennets", "web-search", "web-read", "helper", "contact", "send",
     "conversation", "inbox", "ack", "close", "block", "signup", "verify",
     "provider register", "provider probe", "provider confirm", "provider publish",
 })
@@ -3649,8 +4252,14 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     connect = commands.add_parser("connect", help="Check or recover the saved connection; a new trial needs NEEDWING_INVITATION_CODE")
     connect.add_argument("--client-name", help="Short client label for a new trial registration")
+    connect.add_argument("--accept-terms", action="store_true", help="Record the person's explicit yes to the shown bound-invitation Terms")
+    connect.add_argument("--terms-version", help="Terms version previously shown to the person")
+    connect.add_argument("--locale", help="Preferred locale tag (zh or en)")
     start = commands.add_parser("start", help="Resume a trial or create one with NEEDWING_INVITATION_CODE")
     start.add_argument("--client-name", help="Short client label recorded with the registration, e.g. Codex")
+    start.add_argument("--accept-terms", action="store_true", help="Record the person's explicit yes to the shown bound-invitation Terms")
+    start.add_argument("--terms-version", help="Terms version previously shown to the person")
+    start.add_argument("--locale", help="Preferred locale tag (zh or en)")
     commands.add_parser("account", help="Show the calling account's level, limits and next steps")
     signup = commands.add_parser("signup", help="Print the Terms/Privacy links, or start in-chat sign-up with --email and --accept-terms")
     signup.add_argument("--email", help="The person's email address (required together with --accept-terms)")
@@ -3672,6 +4281,7 @@ def main(argv=None):
     source.add_argument("--request")
     source.add_argument("--request-file", help="UTF-8 text containing only the request")
     run.add_argument("--wait-seconds", type=int, default=120)
+    run.add_argument("--ongoing-need-file", help="UTF-8 JSON: aligned description and keywords for read-only research; if unmatched, the Skill explains and invokes a separate publish write when publication is intended")
     run.add_argument("--new-task", action="store_true", help="Explicitly start another task with identical request text")
     run.add_argument("--confirm-account", metavar="ACCOUNT_ID",
                      help="The person's explicit yes after an account change: rebind a pending saved request to this account id and resend it")
@@ -3735,13 +4345,36 @@ def main(argv=None):
     conversation.add_argument("--conversation-id")
     conversation.add_argument("--wait-seconds", type=int, default=0)
     confirm_option(conversation)
+    need = commands.add_parser("need", help="Save a Need; audience suppliers publishes it, while omitted audience or only_me saves a private draft")
+    need.add_argument("--file", required=True, help="Protected UTF-8 JSON with stable request_id, description, keywords and approved audience")
+    confirm_option(need)
+    needs = commands.add_parser("needs", help="List this account's Needs without submitting anything")
+    confirm_option(needs)
+    need_read = commands.add_parser("need-read", help="Read a saved Need's current state and responses")
+    need_read.add_argument("--need-id", required=True)
+    confirm_option(need_read)
+    need_update = commands.add_parser("need-update", help="Update an owned Need using its current revision; reconciles an uncertain write without repeating it")
+    need_update.add_argument("--need-id", required=True)
+    need_update.add_argument("--file", required=True, help="UTF-8 JSON with description, keywords, text_revision and lifecycle_epoch")
+    confirm_option(need_update)
+    research_need = commands.add_parser("research-need", help="Publish an aligned unmatched summary, resume confirmed publication, or cancel; publish needs --expected-run-id")
+    research_need.add_argument("--session-id", required=True)
+    research_need.add_argument("--action", choices=("publish", "resume", "cancel"), default="resume")
+    research_need.add_argument("--expected-run-id", help="Run id of the displayed summary authorized for publication; required for publish")
+    confirm_option(research_need)
+    need_cancel = commands.add_parser("need-cancel", help="Close an owned Need (stops matching)")
+    need_cancel.add_argument("--need-id", required=True)
+    confirm_option(need_cancel)
     inbox = commands.add_parser("inbox", help="Save and read unacknowledged updates; does not acknowledge them")
     inbox.add_argument("--wait-seconds", type=int, default=0)
     inbox.add_argument("--provider", metavar="PROVIDER_EXTERNAL_ID", help="Read the mailbox of this Agent of the account (its provider_external_id); without it the initiator inbox is read and provider_mailboxes lists where provider messages wait")
+    inbox.add_argument("--lane", choices=("need_requester", "need_supplier"), help="Read Need matches or responses separately from conversation mail")
+    inbox.add_argument("--cursor", help="JSON next_cursor from the previous Need page; positions stay decimal strings")
     confirm_option(inbox)
     ack = commands.add_parser("ack", help="Acknowledge an inbox position after saving and processing its messages")
-    ack.add_argument("--pos", type=int, required=True)
+    ack.add_argument("--pos", required=True)
     ack.add_argument("--provider", metavar="PROVIDER_EXTERNAL_ID", help="Acknowledge in this provider mailbox (the same value as the read); without it the initiator inbox is acknowledged")
+    ack.add_argument("--lane", choices=("need_requester", "need_supplier"), help="Acknowledge this Need lane using its decimal-string position")
     confirm_option(ack)
     close = commands.add_parser("close", help="Close the saved conversation and stop further consultation")
     close.add_argument("--conversation-id")
@@ -3776,9 +4409,9 @@ def main(argv=None):
             client.note_command("provider " + args.provider_command if args.command == "provider" else args.command)
             client.check_version()
             if args.command == "connect":
-                result = client.connect(args.client_name)
+                result = client.connect(args.client_name, accept_terms=args.accept_terms, terms_version=args.terms_version, locale=args.locale)
             elif args.command == "start":
-                result = client.start(args.client_name)
+                result = client.start(args.client_name, accept_terms=args.accept_terms, terms_version=args.terms_version, locale=args.locale)
             elif args.command == "account":
                 result = client.account()
             elif args.command == "signup":
@@ -3816,10 +4449,36 @@ def main(argv=None):
                                      args.new_message, args.confirm_account)
             elif args.command == "conversation":
                 result = client.conversation(args.conversation_id, args.wait_seconds, args.confirm_account)
+            elif args.command == "need":
+                try:
+                    body = json.loads(Path(args.file).read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raise ClientError("invalid_need", "The Need file must be readable UTF-8 JSON.") from None
+                result = client.need(body, args.confirm_account)
+            elif args.command == "research-need":
+                result = client.research_need(args.session_id, args.action, args.confirm_account, args.expected_run_id)
+            elif args.command == "need-cancel":
+                result = client.need_cancel(args.need_id, args.confirm_account)
+            elif args.command == "needs":
+                result = client.needs(args.confirm_account)
+            elif args.command == "need-read":
+                result = client.need_read(args.need_id, args.confirm_account)
+            elif args.command == "need-update":
+                try:
+                    body = json.loads(Path(args.file).read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raise ClientError("invalid_need", "The Need update file must be readable UTF-8 JSON.") from None
+                result = client.need_update(args.need_id, body, args.confirm_account)
             elif args.command == "inbox":
-                result = client.inbox(args.wait_seconds, args.confirm_account, args.provider)
+                try:
+                    cursor = json.loads(args.cursor) if args.cursor is not None else None
+                except ValueError:
+                    raise ClientError("invalid_cursor", "The Need cursor must be a JSON object.") from None
+                result = client.inbox(args.wait_seconds, args.confirm_account, args.provider, args.lane, cursor)
             elif args.command == "ack":
-                result = client.ack(args.pos, args.confirm_account, args.provider)
+                if not args.lane and not re.fullmatch(r"[0-9]+", args.pos):
+                    raise ClientError("invalid_position", "Use a non-negative inbox position returned by Needwing.")
+                result = client.ack(args.pos if args.lane else int(args.pos), args.confirm_account, args.provider, args.lane)
             elif args.command == "close":
                 result = client.close(args.conversation_id, args.confirm_account)
             elif args.command == "block":
@@ -3841,7 +4500,11 @@ def main(argv=None):
                     result = client.provider_status()
             else:
                 text = Path(args.request_file).read_text(encoding="utf-8") if args.request_file else args.request
-                result = client.run(text, args.wait_seconds, args.new_task, args.confirm_account)
+                try:
+                    ongoing = json.loads(Path(args.ongoing_need_file).read_text(encoding="utf-8")) if args.ongoing_need_file else None
+                except (OSError, ValueError):
+                    raise ClientError("invalid_need", "The ongoing-need file must be readable UTF-8 JSON with description and keywords.") from None
+                result = client.run(text, args.wait_seconds, args.new_task, args.confirm_account, ongoing)
             print(json.dumps(redact_data(result, client.secrets()), ensure_ascii=False, indent=2))
             return 0
     except ClientError as exc:

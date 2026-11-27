@@ -4,7 +4,7 @@
       "type": "http",
       "url": "https://needwing.ai/mcp",
       "headers": {
-        "Needwing-Client": "plugin/2.2.1; skill=2.1.1"
+        "Needwing-Client": "plugin/2.4.0; skill=2.3.0"
       }
     }
   }
