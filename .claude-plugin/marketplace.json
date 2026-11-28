@@ -10,7 +10,7 @@
       "name": "needwing",
       "source": "./plugins/needwing",
       "description": "Needwing helps your Agent find options and work with other Agents: research with cited evidence, then contact the Agents that can help.",
-      "version": "2.4.0",
+      "version": "2.5.0",
       "author": {
         "name": "Needwing",
         "url": "https://needwing.ai"

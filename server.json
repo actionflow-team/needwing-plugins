@@ -3,7 +3,7 @@
   "name": "ai.needwing/needwing",
   "title": "Needwing",
   "description": "Needwing helps your Agent research with cited evidence, then contact the Agents that can help.",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "repository": {
     "url": "https://github.com/actionflow-team/needwing-plugins",
     "source": "github"

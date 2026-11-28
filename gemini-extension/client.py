@@ -18,10 +18,10 @@ login    sign in to an existing account; the person approves in their browser
          the approving account, which the person then confirms with
          --confirm-account on the next command)
 account  show the calling account's level, limits and next steps
-provider register, test and publish this Agent's own supply: register (a
-         draft card), probe (the channel proof), confirm, publish and status;
-         drafts need the limited level, publishing needs the person's one
-         browser sign-in (the Agent never opens that page itself)
+provider register and publish this Agent's own supply: register (a
+         draft card), publish and status; drafts need the limited level,
+         publishing needs the person's one browser sign-in (the Agent never
+         opens that page itself)
 diagnose show this account's technical diagnostics (versions, account level,
          request ids, error codes; no task content, tokens or emails);
          --send files them as a support report, --summary TEXT adds context
@@ -35,8 +35,13 @@ helper   --question TEXT: ask a question about Needwing itself
          call key, never sent again as a new call)
 inbox    read unacknowledged updates (--provider PROVIDER_EXTERNAL_ID reads that
          Agent's provider mailbox); ack --pos N [--provider ID] acknowledges
+agents   list this account's live Agents, create one (`agents create [NAME]`),
+         or remember one for this state directory (`agents use ID-OR-NAME`);
+         pass `--agent ID-OR-NAME` before any command to act as that Agent
+         for one call (person accounts create an unnamed Agent automatically;
+         trials have one Agent and take no `--agent` selector)
 block    block the other party in a conversation
-logout   forget the local tokens
+logout   revoke and forget the local tokens
 
 Access tokens expire after about an hour; the client refreshes them
 automatically (with rotation) and never prints them. A refresh token is marked
@@ -50,7 +55,7 @@ trial started by this client requires sign-up (signup, then verify). Verified
 accounts can supply a named key in NEEDWING_API_KEY when no OAuth token is
 saved; connect waits while a requested sign-in or a logout is still saved
 and says so. The same credential powers research, discovery, conversations, and
-the provider registration, probe and publishing flow.
+the provider registration and publishing flow.
 
 Keep the user's natural request and constraints. Needwing searches its supply
 directory first for resources, places, services or collaborators; web research
@@ -80,6 +85,7 @@ import stat
 import platform
 import sys
 import time
+import unicodedata
 from urllib import error, parse, request
 import uuid
 
@@ -99,7 +105,7 @@ INVITATION_ERRORS = {
     "invitation_expired": (409, "This invitation has expired. Ask the person for a new Needwing invitation."),
     "invitation_revoked": (409, "This invitation has been revoked. Ask the person for a new Needwing invitation."),
 }
-CLIENT_VERSION = "2.4.0"  # Synced from the Needwing service contracts.
+CLIENT_VERSION = "2.5.0"  # Synced from the Needwing service contracts.
 VERSION_PATH = "/api/connect/version"
 CLIENT_PATH = "/api/connect/client.py"
 UPGRADE_REQUIRED_EXIT = 3
@@ -126,7 +132,7 @@ REQUEST_ID_WINDOW_SECONDS = 24 * 3600
 # These routes take no credential: a stored (possibly expired) token is never attached to them.
 UNAUTHENTICATED_PATHS = ("/v4/auth/trial", "/v4/account/terms", VERSION_PATH)
 # POSTs that only read: an unusable answer to these leaves nothing that may have been recorded.
-READ_ONLY_POSTS = ("/v4/services/discover",)
+READ_ONLY_POSTS = ("/v4/capabilities/discover",)
 UNCERTAIN_WRITE_GUIDANCE = [
     "The request may already have been accepted: Needwing's answer was lost, empty or unusable, so nothing was recorded as done here.",
     "Run the same command again with the same account — it replays the same saved id and recovers the original result. Do not switch account, rewrite the text or start a new request.",
@@ -202,13 +208,12 @@ def count(value, minimum=1):
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
 
-# Contract enums (packages/contracts: CONVERSATION_DELIVERY_STATES, CONVERSATION_STATES, sign-up, diagnostics, probe check and capability statuses).
+# Contract enums (packages/contracts: CONVERSATION_DELIVERY_STATES, CONVERSATION_STATES, sign-up, diagnostics and capability statuses).
 DELIVERY_STATES = frozenset(("held", "queued", "released", "delivered", "undelivered", "canceled", "unknown"))
 CONVERSATION_STATES = frozenset(("introduced", "active", "paused", "closed", "expired"))
 SIGNUP_STATUSES = frozenset(("code_sent",))
 REPORT_STATUSES = frozenset(("received",))
 PROVIDER_DRAFT_STATUSES = frozenset(("draft",))
-PROBE_CHECK_STATUSES = frozenset(("passed", "failed"))
 CAPABILITY_STATUSES = frozenset(("active", "paused"))
 
 
@@ -247,7 +252,7 @@ def lowered_receipt(receipt):
 
 
 # Provider registration routes (/v4/providers…) need the agent:register scope on the Agent's own token:
-# drafts register and test from the limited level; publishing needs a verified account.
+# drafts register from the limited level; publishing needs a verified account.
 PROVIDER_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 # The account precondition every account-bound call carries (the id a /v4/account read confirmed).
@@ -255,6 +260,11 @@ IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 # The value is a UUID — exactly the shape Needwing's check accepts (anything else is its 422 validation_failed).
 EXPECTED_ACCOUNT_HEADER = "Needwing-Expected-Account"
 EXPECTED_ACCOUNT_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+AGENT_HEADER = "Needwing-Agent"
+AGENT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+AGENT_ID_ANYCASE_PATTERN = re.compile(r"^[0-9a-fA-F]{16}$")
+AGENT_NAME_MAX = 80
+AGENT_CLIENT_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 # Exact shape of Needwing's masked email hint: one leading character + "***@" + one domain char + "***" (+ optional suffix).
 MASKED_EMAIL_PATTERN = re.compile(r"^[^\s@]\*\*\*@[^\s.@]\*\*\*(?:\.[^\s.@]+)?$")
 TERMS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -262,7 +272,7 @@ TERMS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 DERIVED = object()
 A2A_CARD_FIELDS = ("card_url", "endpoint_challenge_id", "skill_id", "protocol_version")
 CARD_FIELDS = frozenset({"provider_external_id", "display_name", "capability_external_id", "description",
-                         "keywords", "reply_window_seconds", "channel", "conversation",
+                         "keywords", "reply_window_seconds", "channel", "purpose", "conversation",
                          "card_url", "endpoint_challenge_id", "skill_id", "protocol_version",
                          "accept_trial_contacts"})
 
@@ -347,7 +357,7 @@ SECRET_SUBSTRING_MIN = 8
 # its protocol fields, so a setting such as NEEDWING_INVITATION_CODE=code or =invitation_invalid
 # cannot erase the reason for a refusal. Free text (message, guidance) and nested data are redacted.
 ENVELOPE_KEYS = frozenset({"ok", "result", "error", "code", "status", "level", "kind", "action",
-                           "guidance", "message", "http_status", "next", "notice"})
+                           "guidance", "message", "http_status", "next", "notice", "agent_id"})
 PROTOCOL_FIELDS = frozenset({"code", "status", "level", "kind", "action"})
 PROTOCOL_VALUE = re.compile(r"[a-zA-Z0-9_:-]{1,80}")
 
@@ -676,11 +686,13 @@ class NoRedirect(request.HTTPRedirectHandler):
 
 
 class Client:
-    def __init__(self, base_url=DEFAULT_ORIGIN, state_dir=None, ca_file=None):
+    def __init__(self, base_url=DEFAULT_ORIGIN, state_dir=None, ca_file=None, agent=None):
         self.base = origin(base_url)
         self.state = Path(state_dir if state_dir is not None else default_state_dir()).absolute()
         private_dir(self.state)
         self.identity_path = self.state / "identity.json"
+        self.agent_path = self.state / "agent.json"
+        self.agent_create_pending_path = self.state / "agent-create-pending.json"
         self.last_path = self.state / "last-task.json"
         self.tasks = self.state / "tasks"
         private_dir(self.tasks)
@@ -712,6 +724,199 @@ class Client:
         self.transport = request.build_opener(NoRedirect(), request.HTTPSHandler(context=context))
         # The subcommand this process ran, set by main() right after construction.
         self._command = ""
+        self._agent_override = self.normalize_agent_selector(agent) if agent is not None else None
+        self._resolved_override_agent = None
+        self._last_account_level = None
+        self._pending_agent_header = None
+
+    @staticmethod
+    def normalize_agent_selector(value):
+        if not isinstance(value, str):
+            raise ClientError("invalid_agent", "Pass an Agent id (16 hex) or name (1-80 characters).")
+        text = unicodedata.normalize("NFC", value).strip()
+        if not text or len(text) > AGENT_NAME_MAX or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            raise ClientError("invalid_agent", "Pass an Agent id (16 hex) or name (1-80 characters without control characters).")
+        return text
+
+    @staticmethod
+    def validate_agent_name(value):
+        text = Client.normalize_agent_selector(value)
+        if AGENT_ID_ANYCASE_PATTERN.fullmatch(text):
+            raise ClientError("invalid_agent", "Agent names cannot be shaped like a 16-hex public id.")
+        return text
+
+    def _agent_file_path(self):
+        return getattr(self, "agent_path", self.state / "agent.json")
+
+    def _agent_pending_path(self):
+        return getattr(self, "agent_create_pending_path", self.state / "agent-create-pending.json")
+
+    def _clear_agent_for_account_change(self, new_account_id):
+        path = self._agent_file_path()
+        if not path.exists() or not isinstance(new_account_id, str):
+            return
+        try:
+            saved = read_private(path)
+        except (ClientError, OSError, ValueError):
+            return
+        saved_account = saved.get("account_id") if isinstance(saved, dict) else None
+        if isinstance(saved_account, str) and saved_account.lower() != new_account_id.lower():
+            path.unlink(missing_ok=True)
+
+    def is_trial_account(self):
+        if self.api_key():
+            return False
+        last_level = getattr(self, "_last_account_level", None)
+        if last_level in ("limited", "verified"):
+            return False
+        if last_level == "trial":
+            return True
+        kind = (self.tokens() or {}).get("kind") or self.identity.get("connection_kind")
+        if kind == "trial":
+            return True
+        if kind == "account":
+            return False
+        acct = self.account()
+        return acct.get("level") == "trial"
+
+    def resolve_acting_agent_id(self, account_id=None):
+        """Resolve the 16-hex Agent public id for a person account call (F3, H4, H22, R2)."""
+        override = getattr(self, "_agent_override", None)
+        if override is not None:
+            if AGENT_ID_ANYCASE_PATTERN.fullmatch(override):
+                return override.lower()
+            cached = getattr(self, "_resolved_override_agent", None)
+            if cached is not None:
+                return cached
+            created = self.authorized("POST", "/v4/agents", {"name": override},
+                                      expected_account=account_id if isinstance(account_id, str) else DERIVED,
+                                      skip_agent=True)
+            agent_id = created.get("id") if isinstance(created, dict) else None
+            if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+                raise uncertain_write("invalid_receipt", "The Agent lookup/create answer carried no valid Agent id.")
+            self._resolved_override_agent = agent_id
+            return agent_id
+
+        path = self._agent_file_path()
+        saved = read_private(path) if path.exists() else None
+        if saved is not None:
+            if not isinstance(saved, dict):
+                raise ClientError("invalid_state", "The saved agent state in agent.json is invalid.")
+            saved_account = saved.get("account_id")
+            if isinstance(saved_account, str) and isinstance(account_id, str) and saved_account.lower() != account_id.lower():
+                path.unlink(missing_ok=True)
+                saved = None
+            elif saved.get("removed") is True:
+                removed_id = saved.get("id") if isinstance(saved.get("id"), str) and AGENT_ID_PATTERN.fullmatch(saved["id"]) else None
+                raise ClientError(
+                    "agent_removed",
+                    "This Agent was removed, and that is final. Stop, tell the person and ask which Agent to use; never create a replacement automatically.",
+                    http_status=410,
+                    **({"agent_id": removed_id} if removed_id else {}),
+                    guidance=["Run " + cli("agents") + " to list live Agents and " + cli("agents use <id|name>") + " to pick another Agent, or pass --agent <id|name>."],
+                )
+            elif isinstance(saved.get("id"), str) and AGENT_ID_PATTERN.fullmatch(saved["id"]):
+                return saved["id"]
+
+        req_id = saved.get("client_request_id") if isinstance(saved, dict) else None
+        if not isinstance(req_id, str) or not AGENT_CLIENT_REQUEST_ID_PATTERN.fullmatch(req_id):
+            req_id = "nw-" + uuid.uuid4().hex
+            pending_record = {"client_request_id": req_id}
+            if isinstance(account_id, str) and account_id:
+                pending_record["account_id"] = account_id
+            write_private(path, pending_record)
+        created = self.authorized("POST", "/v4/agents", {"client_request_id": req_id},
+                                  expected_account=account_id if isinstance(account_id, str) else DERIVED,
+                                  skip_agent=True)
+        agent_id = created.get("id") if isinstance(created, dict) else None
+        if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+            raise uncertain_write("invalid_receipt", "The Agent create answer carried no Agent id; its request id stays saved for an exact replay.")
+        record = {"id": agent_id}
+        if isinstance(created.get("name"), str) and created["name"]:
+            record["name"] = created["name"]
+        if isinstance(account_id, str) and account_id:
+            record["account_id"] = account_id
+        write_private(path, record)
+        return agent_id
+
+    def agents_list(self, confirm_account=None):
+        self.resolve_account_change(confirm_account)
+        result = self.authorized("GET", "/v4/agents", skip_agent=True)
+        if not isinstance(result, dict) or not isinstance(result.get("agents"), list):
+            raise ClientError("invalid_response", "The Agents response carried no agents list; saved state was retained.")
+        return result
+
+    def agents_create(self, name=None, client_request_id=None, confirm_account=None):
+        self.resolve_account_change(confirm_account)
+        account = self.active_account()
+        pending_path = self._agent_pending_path()
+        used_pending = False
+        if name is not None:
+            clean_name = self.validate_agent_name(name)
+            body = {"name": clean_name}
+            if client_request_id is not None:
+                if not isinstance(client_request_id, str) or not AGENT_CLIENT_REQUEST_ID_PATTERN.fullmatch(client_request_id):
+                    raise ClientError("invalid_request", "client_request_id must be 1-128 characters of A-Za-z0-9._:-.")
+                body["client_request_id"] = client_request_id
+        else:
+            if client_request_id is not None:
+                if not isinstance(client_request_id, str) or not AGENT_CLIENT_REQUEST_ID_PATTERN.fullmatch(client_request_id):
+                    raise ClientError("invalid_request", "client_request_id must be 1-128 characters of A-Za-z0-9._:-.")
+                req_id = client_request_id
+            else:
+                saved = read_private(pending_path) if pending_path.exists() else None
+                if isinstance(saved, dict) and saved.get("account_id") == account and isinstance(saved.get("client_request_id"), str) and AGENT_CLIENT_REQUEST_ID_PATTERN.fullmatch(saved["client_request_id"]):
+                    req_id = saved["client_request_id"]
+                else:
+                    req_id = "nw-" + uuid.uuid4().hex
+                    write_private(pending_path, {"account_id": account, "client_request_id": req_id})
+                used_pending = True
+            body = {"client_request_id": req_id}
+        result = self.authorized("POST", "/v4/agents", body, skip_agent=True)
+        agent_id = result.get("id") if isinstance(result, dict) else None
+        if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+            raise uncertain_write("invalid_receipt", "The Agent create answer carried no Agent id; keep the request id to replay safely.")
+        if used_pending and pending_path.exists():
+            pending_path.unlink(missing_ok=True)
+        return result
+
+    def agents_use(self, selector, confirm_account=None):
+        self.resolve_account_change(confirm_account)
+        account = self.active_account()
+        if self.is_trial_account():
+            raise ClientError("agent_not_actable", "A trial account has one Agent and takes no selector.", http_status=403)
+        clean = self.normalize_agent_selector(selector)
+        if AGENT_ID_ANYCASE_PATTERN.fullmatch(clean):
+            target_id = clean.lower()
+            listed = self.agents_list()
+            found = next((item for item in listed["agents"] if isinstance(item, dict) and item.get("id") == target_id), None)
+            if found is None:
+                raise ClientError("agent_not_found", "That Agent id is not one of this account's live Agents.", http_status=404,
+                                  guidance=["Run " + cli("agents") + " to list live Agents."])
+            record = {"id": target_id, "account_id": account}
+            if isinstance(found.get("name"), str) and found["name"]:
+                record["name"] = found["name"]
+            write_private(self._agent_file_path(), record)
+            return {**found, "stored": True}
+        clean_name = self.validate_agent_name(clean)
+        created = self.authorized("POST", "/v4/agents", {"name": clean_name}, skip_agent=True)
+        agent_id = created.get("id") if isinstance(created, dict) else None
+        if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+            raise uncertain_write("invalid_receipt", "The Agent create answer carried no Agent id.")
+        record = {"id": agent_id, "account_id": account}
+        if isinstance(created.get("name"), str) and created["name"]:
+            record["name"] = created["name"]
+        write_private(self._agent_file_path(), record)
+        return {**created, "stored": True}
+
+    def revoke_tokens(self, tokens):
+        """Revoke an OAuth token pair on the server (RFC 7009)."""
+        if not isinstance(tokens, dict):
+            return
+        token = tokens.get("refresh_token") if isinstance(tokens.get("refresh_token"), str) and tokens["refresh_token"] else tokens.get("access_token")
+        if not isinstance(token, str) or not token:
+            return
+        self.call("POST", "/oauth/revoke", form={"client_id": OAUTH_CLIENT, "token": token})
 
     def note_command(self, command):
         """Remember the subcommand this process ran (provider commands as
@@ -875,6 +1080,11 @@ class Client:
             if not isinstance(expected_account, str) or not EXPECTED_ACCOUNT_PATTERN.fullmatch(expected_account):
                 raise ClientError("invalid_state", "The saved account id is malformed; run " + cli("account") + " to confirm it.")
             headers[EXPECTED_ACCOUNT_HEADER] = expected_account
+        agent_id = getattr(self, "_pending_agent_header", None)
+        if agent_id is not None and path.startswith("/v4/"):
+            if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id):
+                raise ClientError("invalid_agent", "The acting Agent id is malformed.")
+            headers[AGENT_HEADER] = agent_id
         if not path.startswith("/oauth/") and path not in UNAUTHENTICATED_PATHS:
             access = (self.tokens() or {}).get("access_token") or self.api_key()
             if isinstance(access, str) and access:
@@ -1029,6 +1239,29 @@ class Client:
                     sign_in_hint = "Run: " + cli("login") + " (or ask the person to sign in at " + self.base + "/login)."
                     if sign_in_hint not in guidance:
                         guidance.append(sign_in_hint)
+            if code == "agent_removed" and exc.code == 410:
+                removed_id = detail.get("agent_id")
+                if isinstance(removed_id, str) and AGENT_ID_PATTERN.fullmatch(removed_id):
+                    extras["agent_id"] = removed_id
+                else:
+                    removed_id = None
+                agent_path = self._agent_file_path()
+                if getattr(self, "_agent_override", None) is None and agent_path.exists():
+                    try:
+                        saved_agent = read_private(agent_path)
+                    except (ClientError, OSError, ValueError):
+                        saved_agent = None
+                    if isinstance(saved_agent, dict) and (removed_id is None or saved_agent.get("id") == removed_id):
+                        saved_agent["removed"] = True
+                        write_private(agent_path, saved_agent)
+                raise ClientError(
+                    "agent_removed",
+                    "This Agent was removed, and that is final. Stop, tell the person and ask which Agent to use; never create a replacement automatically.",
+                    http_status=410,
+                    request_id=safe_id,
+                    **({"agent_id": removed_id} if removed_id else {}),
+                    guidance=["Run " + cli("agents") + " to list live Agents and " + cli("agents use <id|name>") + " to pick another Agent."],
+                ) from None
             if guidance:
                 extras["guidance"] = guidance
             if confirmed_inactive is not None:
@@ -1063,7 +1296,7 @@ class Client:
                               **({"guidance": uncertain} if uncertain else {}))
         return result
 
-    def authorized(self, method, path, body=None, idempotency_key=None, retry=True, expected_account=DERIVED):
+    def authorized(self, method, path, body=None, idempotency_key=None, retry=True, expected_account=DERIVED, skip_agent=False):
         """A call with the stored token: refresh when expired, retry once on 401.
 
         Every account-bound call names the account it acts for: the header value is
@@ -1101,25 +1334,53 @@ class Client:
                     # the cached id or the trial receipt: once a move is detected,
                     # nothing account-bound is sent in this command.
                     raise self.account_changed_error()
+        agent_id = None
+        if not skip_agent:
+            if self.is_trial_account():
+                if getattr(self, "_agent_override", None) is not None:
+                    raise ClientError("agent_not_actable", "A trial account has one Agent and takes no --agent selector.", http_status=403)
+            else:
+                account_for_agent = account if isinstance(account, str) else self.bound_account()
+                agent_id = self.resolve_acting_agent_id(account_for_agent)
+        previous_agent = getattr(self, "_pending_agent_header", None)
+        self._pending_agent_header = agent_id
         try:
-            return self.call(method, path, body, idempotency_key, expected_account=account)
-        except ClientError as exc:
-            if retry and self.tokens() is not None and exc.payload.get("http_status") == 401 and exc.payload.get("code") != "upgrade_required":
-                self.refresh_tokens()
-                try:
-                    # The retried attempt runs through the same 409 handling below: a
-                    # move that surfaces only after the refresh is recorded durably
-                    # just like one on the first attempt.
-                    return self.call(method, path, body, idempotency_key, expected_account=account)
-                except ClientError as retried:
-                    exc = retried
-            if exc.payload.get("code") == "account_changed" and isinstance(account, str) and account:
-                self.record_account_change(account)
-                raise self.account_changed_error() from None
-            # The retry's own outcome surfaces, not the 401 that triggered it: a
-            # definitive answer after a successful refresh (account_required, a
-            # quota, an uncertain transport) is the result the caller must see.
-            raise exc from None
+            try:
+                return self.call(method, path, body, idempotency_key, expected_account=account)
+            except ClientError as exc:
+                if retry and self.tokens() is not None and exc.payload.get("http_status") == 401 and exc.payload.get("code") != "upgrade_required":
+                    self.refresh_tokens()
+                    try:
+                        # The retried attempt runs through the same 409 handling below: a
+                        # move that surfaces only after the refresh is recorded durably
+                        # just like one on the first attempt.
+                        return self.call(method, path, body, idempotency_key, expected_account=account)
+                    except ClientError as retried:
+                        exc = retried
+                if (not skip_agent and retry and exc.payload.get("code") == "agent_required" and agent_id is None
+                        and getattr(self, "_last_account_level", None) is None
+                        and ((self.tokens() or {}).get("kind") or self.identity.get("connection_kind")) == "trial"):
+                    # Out-of-band trial conversion (same account_id, cached kind still "trial"): refresh once and retry with the Agent.
+                    self.account()
+                    if isinstance(self.identity.get("account_change_pending"), dict):
+                        raise self.account_changed_error() from None
+                    if not self.is_trial_account():
+                        account_for_agent = account if isinstance(account, str) else self.bound_account()
+                        agent_id = self.resolve_acting_agent_id(account_for_agent)
+                        self._pending_agent_header = agent_id
+                        try:
+                            return self.call(method, path, body, idempotency_key, expected_account=account)
+                        except ClientError as retried:
+                            exc = retried
+                if exc.payload.get("code") == "account_changed" and isinstance(account, str) and account:
+                    self.record_account_change(account)
+                    raise self.account_changed_error() from None
+                # The retry's own outcome surfaces, not the 401 that triggered it: a
+                # definitive answer after a successful refresh (account_required, a
+                # quota, an uncertain transport) is the result the caller must see.
+                raise exc from None
+        finally:
+            self._pending_agent_header = previous_agent
 
     def reconnect_required(self, kind, reason=None):
         """The saved pair is gone and the person reconnects. `reason` replaces the message
@@ -1794,7 +2055,7 @@ class Client:
         if invitation_code:
             body["invitation_code"] = invitation_code
         try:
-            result = self.authorized("POST", "/v4/account/sign-up", body)
+            result = self.authorized("POST", "/v4/account/sign-up", body, skip_agent=True)
         except ClientError as exc:
             refusal = malformed_invitation_refusal(exc, malformed, self.base)
             if refusal is not None:
@@ -1830,7 +2091,7 @@ class Client:
         # Submitting the code is account-bound: while a move waits for the person's
         # yes nothing is transmitted, with the same confirmation path as every gate.
         self.resolve_account_change(confirm_account)
-        result = self.authorized("POST", "/v4/account/verify", {"code": code})
+        result = self.authorized("POST", "/v4/account/verify", {"code": code}, skip_agent=True)
         # The same identity rule as every send: a malformed read (a list-valued level,
         # a missing id) never reports success and never converts the connection.
         account_id = self.confirmed_identity(result)
@@ -1856,7 +2117,7 @@ class Client:
         output, _ = self.with_next(result, [])
         output = {key: output[key] for key in ("account_id", "level", "email", "next") if key in output}
         output["guidance"] = [
-            "The account is now limited: higher limits, and provider drafts can be registered and tested.",
+            "The account is now limited: higher limits, and provider drafts can be registered.",
             "Publishing needs verified: ask the person to sign in once at " + self.base + " (the web human check verifies), then run " + cli("account") + ".",
         ] + self.render_next(result.get("next"))
         return output
@@ -1929,7 +2190,7 @@ class Client:
                 raise ClientError("already_signed_in", "This connection already belongs to a Needwing account. Run " + cli("account") + ".")
             print("Approval closes the trial and moves this connection to the existing account. Trial history stays with the trial.", flush=True)
             try:
-                approval = self.authorized("POST", "/v4/account/sign-in", {}, expected_account=trial_id)
+                approval = self.authorized("POST", "/v4/account/sign-in", {}, expected_account=trial_id, skip_agent=True)
             except ClientError as exc:
                 if exc.payload.get("guidance") == UNCERTAIN_WRITE_GUIDANCE:
                     raise ClientError(exc.payload["code"], "Needwing may have started sign-in, but its approval code was unavailable.",
@@ -1982,6 +2243,7 @@ class Client:
                 self.identity.pop("login_requested", None)
                 for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
                     self.identity.pop(k, None)
+                self._clear_agent_for_account_change(account_id)
                 # The server caps the moved credential to these two scopes.
                 tokens = self.tokens()
                 scope = " ".join(part for part in tokens.get("scope", "").split() if part in {"research", "engage"})
@@ -2025,6 +2287,9 @@ class Client:
         if scope is not None and not SCOPE_PATTERN.fullmatch(scope):
             raise ClientError("invalid_scope", "Use space-separated scopes of letters, digits, : _ or spaces.")
         form["scope"] = scope if scope is not None else "research engage agent:register agent:engage"
+        hint = self.identity.get("account_id") or self.identity.get("account_hint")
+        if isinstance(hint, str) and EXPECTED_ACCOUNT_PATTERN.fullmatch(hint) and self.identity.get("connection_kind") != "trial":
+            form["account_hint"] = hint
         # A denied, expired or interrupted sign-in must never turn into an automatic trial.
         self.identity["login_requested"] = True
         write_private(self.identity_path, self.identity)
@@ -2060,21 +2325,28 @@ class Client:
                     raise ClientError("expired_token", "The device code expired. Run login again for a new code.") from None
                 raise
             # One durable write installs the new credentials with the previous account's
-            # cached id and any pending move already gone: an interrupted login can
-            # never pair the new pair with the account id an earlier sign-in confirmed,
-            # and a deliberate sign-in is itself the person's choice of account — the
-            # recorded move it supersedes must not keep the fresh connection gated on a
-            # confirmation for a state it no longer holds (the identity read after
-            # login then caches the new id normally). Saved drafts keep their own
-            # bindings independently: a draft naming the old account still refuses
-            # under the new sign-in instead of being silently rebound or resent.
+            # cached id and any pending move already gone BEFORE best-effort revocation of
+            # the old expired pair (N2: never lose a newly minted grant if revoke fails):
+            # an interrupted login can never pair the new pair with the account id an
+            # earlier sign-in confirmed, and a deliberate sign-in is itself the person's
+            # choice of account — the recorded move it supersedes must not keep the fresh
+            # connection gated on a confirmation for a state it no longer holds (the identity
+            # read after login then caches the new id normally). Saved drafts keep their own
+            # bindings independently: a draft naming the old account still refuses under the
+            # new sign-in instead of being silently rebound or resent.
             self.identity.pop("account_id", None)
+            self.identity.pop("account_hint", None)
             self.identity.pop("account_connection", None)
             self.identity.pop("account_change_pending", None)
             self.identity.pop("trial_sign_in", None)
             for k in ("enrollment_kind", "request_id", "request_id_created_at", "trial_terms_confirmation"):
                 self.identity.pop(k, None)
             self.save_tokens(result, "account")
+            if active is not None:
+                try:
+                    self.revoke_tokens(active)
+                except ClientError:
+                    pass
             return self.login_output(result.get("scope", ""))
 
     # ---- diagnostics -------------------------------------------------------
@@ -2132,8 +2404,13 @@ class Client:
         active = self.tokens()
         had = active is not None
         trial = had and active.get("kind") == "trial"
-        self.identity["connection_kind"] = self.identity.get("connection_kind") or (self.tokens() or {}).get("kind") or "unknown"
+        if had:
+            self.revoke_tokens(active)
+        self.identity["connection_kind"] = self.identity.get("connection_kind") or (active or {}).get("kind") or "unknown"
         self.identity["connection_paused"] = True
+        prev_account = self.identity.get("account_id")
+        if isinstance(prev_account, str) and EXPECTED_ACCOUNT_PATTERN.fullmatch(prev_account) and not trial:
+            self.identity["account_hint"] = prev_account
         self.identity.pop("trial_sign_in", None)
         self.identity.pop("tokens", None)
         self.identity.pop("refresh_in_flight", None)
@@ -2142,7 +2419,7 @@ class Client:
         self.identity.pop("account_id", None)
         self.identity.pop("account_connection", None)
         write_private(self.identity_path, self.identity)
-        guidance = ["Local tokens were forgotten." if had else "There were no local tokens."]
+        guidance = ["Tokens were revoked and local credentials were forgotten." if had else "There were no local tokens."]
         if trial:
             guidance.append("The trial stays until 30 days without activity. Needwing then closes its open conversations and notifies the providers.")
         guidance.append(cli("login") + " signs in to an existing account.")
@@ -2153,8 +2430,12 @@ class Client:
         # that establishes which account the credential belongs to now, so it must
         # succeed exactly when the account changed (authorized() derives the header
         # for every other account-bound call from what this read confirms).
-        result = self.authorized("GET", "/v4/account", expected_account=None)
+        result = self.authorized("GET", "/v4/account", expected_account=None, skip_agent=True)
         level = result.get("level") if isinstance(result.get("level"), str) else ""
+        if level in {"trial", "limited", "verified"}:
+            self._last_account_level = level
+        if level == "trial" and getattr(self, "_agent_override", None) is not None:
+            raise ClientError("agent_not_actable", "A trial account has one Agent and takes no --agent selector.", http_status=403)
         account_id = result.get("account_id")
         if level in {"trial", "limited", "verified"} and isinstance(account_id, str) and account_id:
             if not EXPECTED_ACCOUNT_PATTERN.fullmatch(account_id):
@@ -2231,7 +2512,7 @@ class Client:
         guidance = {
             "trial": ["Trial account: research is available within its limits. A trial started by this client needs in-chat sign-up before opening provider contact.",
                       "Convert in chat (the trial's work is kept): " + cli("signup") + " shows the Terms and Privacy links, then " + cli("signup --email PERSON@example.com --accept-terms") + " and " + cli("verify --code CODE") + "."],
-            "limited": ["Limited account: confirmed email, higher limits; provider drafts can be registered and tested.",
+            "limited": ["Limited account: confirmed email, higher limits; provider drafts can be registered.",
                         "Publishing needs verified: the person signs in once at " + self.base + "."],
             "verified": ["Verified account: normal limits, publishing, named keys and web settings."],
         }.get(level, ["Follow the next steps below."])
@@ -2314,20 +2595,6 @@ class Client:
                               guidance=["Register the draft card first: " + cli("provider register --file card.json")])
         return self.identifier(provider_id, "provider_id")
 
-    def provider_for_probe(self, conversation_id):
-        """Find the provider that owns this saved probe conversation."""
-        for candidate in self.providers.glob("*.json"):
-            try:
-                record = read_private(candidate)
-            except ClientError:
-                continue
-            for state in (record.get("revisions") or {}).values():
-                if isinstance(state, dict) and isinstance(state.get("probe"), dict) and \
-                        state["probe"].get("conversation_id") == conversation_id:
-                    return self.provider_id_of(record)
-        raise ClientError("no_probe", "No saved probe for that conversation in this state directory.",
-                          guidance=["Start the channel proof first: " + cli("provider probe")])
-
     def saved_key(self, path, record, state, name):
         """Return the durable per-revision idempotency key, creating it before any send."""
         key = state.get(name)
@@ -2370,6 +2637,11 @@ class Client:
         channel = card.get("channel")
         if channel not in ("mcp", "a2a"):
             raise ClientError("invalid_card", 'channel is "mcp" (Needwing mailbox) or "a2a" (the Agent\'s own endpoint).')
+        if "purpose" in card:
+            if card["purpose"] not in ("service", "ask"):
+                raise ClientError("invalid_card", 'purpose is "service" or "ask".')
+            if channel != "mcp":
+                raise ClientError("invalid_card", 'purpose "ask" requires channel "mcp".')
         if channel == "mcp":
             if any(card.get(name) is not None for name in A2A_CARD_FIELDS):
                 raise ClientError("invalid_card", "A mailbox (mcp) card has none of the A2A binding fields.")
@@ -2413,73 +2685,11 @@ class Client:
             "channel": card.get("channel"),
         }
         write_private(self.identity_path, self.identity)
-        output = {name: result[name] for name in ("provider_id", "capability_id", "revision", "channel", "status") if name in result}
+        output = {name: result[name] for name in ("provider_id", "capability_id", "revision", "channel", "purpose", "agent", "status") if name in result}
         output["guidance"] = [
             "Draft registered; it stays private until its revision is published.",
-            "Start the channel proof: " + cli("provider probe") + " — then echo the nonce from the provider's own channel and run " + cli("provider confirm") + ".",
+            "Publish it when ready: " + cli("provider publish") + ". Publishing goes live immediately after the person's one web sign-in.",
         ] + self.render_next(result.get("next"))
-        return output
-
-    def provider_probe(self, capability_id=None, revision=None, confirm_account=None):
-        self.resolve_account_change(confirm_account)
-        path, record = self.provider_record(capability_id)
-        revision = self.revision_of(record, revision)
-        state = record.setdefault("revisions", {}).setdefault(str(revision), {})
-        key = self.saved_key(path, record, state, "probe_key")
-        try:
-            result = self.authorized("POST", "/v4/providers/%s/capabilities/%s/revisions/%d/probe" % (self.provider_id_of(record), record["capability_id"], revision),
-                                     {}, idempotency_key=key)
-        except ClientError as exc:
-            if exc.payload.get("code") == "idempotency_conflict":
-                exc.payload["guidance"] = [
-                    "The saved probe key was already used for a different card. Register the updated card as a new draft revision (" + cli("provider register --file card.json") + ") and probe that revision.",
-                ] + exc.payload.get("guidance", [])
-            raise
-        deadline = result.get("deadline_at")
-        if (not uuid_text(result.get("conversation_id")) or not uuid_text(result.get("probe_id")) or
-                not isinstance(deadline, str) or not deadline or len(deadline) > 64):
-            raise uncertain_write("invalid_response", "The probe answer carried no conversation, probe id and deadline; nothing was saved as started.")
-        result["conversation_id"], result["probe_id"] = result["conversation_id"].lower(), result["probe_id"].lower()
-        state["probe"] = {"conversation_id": result["conversation_id"], "probe_id": result["probe_id"], "deadline_at": deadline}
-        record["last_conversation"] = result["conversation_id"]
-        write_private(path, record)
-        provider = self.provider_identity()
-        if provider is not None and provider.get("capability_id") == record["capability_id"]:
-            provider["conversation_id"] = result["conversation_id"]
-            write_private(self.identity_path, self.identity)
-        output = {name: result[name] for name in ("conversation_id", "probe_id", "deadline_at", "purpose") if name in result}
-        output["capability_id"] = record["capability_id"]
-        output["revision"] = revision
-        output["guidance"] = [
-            "The probe conversation's first message carries a one-time nonce: read it, then echo that exact text from the provider's own channel before " + deadline + ".",
-            "Mailbox (mcp) provider: needwing_inbox (with provider_external_id) or needwing_conversation to read the nonce, needwing_send to echo it (" + self.base + "/mcp). A2A provider: the nonce arrives at the declared endpoint; reply with the same text from that endpoint.",
-            "Then confirm: " + cli("provider confirm") + " (repeatable until it reports passed).",
-        ]
-        return output
-
-    def provider_confirm(self, conversation_id=None, confirm_account=None):
-        self.resolve_account_change(confirm_account)
-        if conversation_id is None:
-            conversation_id = (self.provider_identity() or {}).get("conversation_id")
-        conversation_id = self.identifier(conversation_id, "conversation_id")
-        provider_id = self.provider_for_probe(conversation_id)
-        try:
-            result = self.authorized("POST", "/v4/providers/" + provider_id + "/probes/" + conversation_id + "/confirm", {})
-        except ClientError as exc:
-            if exc.payload.get("code") == "trial_not_answered":
-                exc.payload["guidance"] = [
-                    "The provider has not echoed the probe nonce yet. Read the nonce from the provider's own channel (mcp: needwing_inbox with provider_external_id or needwing_conversation, then needwing_send; a2a: the declared endpoint), echo that exact text, and repeat this command before the deadline.",
-                ] + exc.payload.get("guidance", [])
-            raise
-        if not enum_value(result.get("status"), PROBE_CHECK_STATUSES):
-            raise uncertain_write("invalid_response", "The confirm answer carried no valid status; nothing was recorded as confirmed here.")
-        self.note_provider_event(conversation_id, "confirm",
-                                 {"status": result["status"], "check_id": result.get("check_id"), "revision": result.get("revision")})
-        output = {name: result[name] for name in ("status", "check_id", "revision") if name in result}
-        output["conversation_id"] = conversation_id
-        output["guidance"] = (["Probe passed: publish this exact revision with " + cli("provider publish") + "."]
-                              if result["status"] == "passed" else
-                              ["Probe check recorded as " + result["status"] + "; repeat the same command until it reports passed."])
         return output
 
     def provider_publish(self, capability_id=None, revision=None, confirm_account=None):
@@ -2495,13 +2705,9 @@ class Client:
             code = exc.payload.get("code")
             if code == "verification_required":
                 exc.payload["guidance"] = [
-                    "Publishing needs a verified account: a limited account's drafts can register and be tested, but not publish.",
+                    "Publishing needs a verified account: a limited account can register drafts, but not publish.",
                     "Ask the person to sign in once at " + self.base + "/login — that web sign-in verifies the account. Never open that page yourself.",
                     "After the person has signed in, run the same command again; the saved key replays it.",
-                ] + exc.payload.get("guidance", [])
-            elif code in ("checks_stale", "trial_not_answered"):
-                exc.payload["guidance"] = [
-                    "This revision needs its passed channel proof first: run " + cli("provider probe") + ", echo the nonce from the provider's own channel, " + cli("provider confirm") + ", then publish again.",
                 ] + exc.payload.get("guidance", [])
             raise
         capability = result.get("capability")
@@ -2512,23 +2718,9 @@ class Client:
         output = {"capability_id": record["capability_id"], "revision": revision, "status": capability["status"]}
         output["guidance"] = [
             "Published: capability revision " + str(revision) + " is now " + capability["status"] + ".",
-            "A changed card is a new draft revision: re-register (the same provider_external_id keeps the provider), then probe, confirm and publish that revision.",
+            "A changed card is a new draft revision: re-register (the same provider_external_id keeps the provider), then publish that revision.",
         ] + self.render_next(result.get("next"))
         return output
-
-    def note_provider_event(self, conversation_id, name, receipt):
-        """Attach a probe/confirm receipt to the saved revision that owns this conversation."""
-        for candidate in self.providers.glob("*.json"):
-            try:
-                record = read_private(candidate)
-            except ClientError:
-                continue
-            for state in (record.get("revisions") or {}).values():
-                if isinstance(state, dict) and isinstance(state.get("probe"), dict) and \
-                        state["probe"].get("conversation_id") == conversation_id:
-                    state[name] = receipt
-                    write_private(candidate, record)
-                    return
 
     def provider_status(self):
         """Local view of the saved provider state; it never sends a request."""
@@ -2542,22 +2734,19 @@ class Client:
         revisions = []
         for number, state in sorted((record.get("revisions") or {}).items(),
                                     key=lambda item: int(item[0]) if str(item[0]).isdigit() else 0):
-            probe = state.get("probe") if isinstance(state.get("probe"), dict) else {}
-            confirm = state.get("confirm") if isinstance(state.get("confirm"), dict) else {}
+            # State left by an earlier client may hold records of its old channel test; they are not shown.
             publish = state.get("publish") if isinstance(state.get("publish"), dict) else {}
             revisions.append({
                 "revision": int(number),
-                "probe": {name: probe[name] for name in ("conversation_id", "deadline_at") if name in probe} or None,
-                "confirmed": confirm.get("status"),
                 "published": publish.get("status"),
             })
         output = {
             "provider": {name: provider[name] for name in ("provider_id", "capability_id", "revision",
                                                            "provider_external_id", "capability_external_id",
-                                                           "channel", "conversation_id") if name in provider},
+                                                           "channel") if name in provider},
             "latest_status": (record.get("receipt") or {}).get("status"),
             "revisions": revisions,
-            "guidance": ["Saved local state; nothing was sent. Continue the flow: probe, echo the nonce from the provider's own channel, confirm, publish."],
+            "guidance": ["Saved local state; nothing was sent. Publish a revision with " + cli("provider publish") + "."],
         }
         return output
 
@@ -2581,7 +2770,7 @@ class Client:
     def discover(self, description, confirm_account=None):
         self.resolve_account_change(confirm_account)
         self.message_text(description)
-        result = self.authorized("POST", "/v4/services/discover", {"description": description, "limit": 20})
+        result = self.authorized("POST", "/v4/capabilities/discover", {"description": description, "limit": 20})
         write_private(self.state / "discovery.json", result)
         return result
 
@@ -2641,33 +2830,46 @@ class Client:
             return result
         need = result.get("need", {})
         responses = result.get("responses")
+        matches = result.get("matches")
+        peer_matches = result.get("peer_matches")
         if (isinstance(need, dict) and need.get("id") == need_id
-                and need.get("state") in {"open", "closed"} and isinstance(responses, list)):
+                and need.get("state") in {"open", "closed"}
+                and (isinstance(responses, list) or isinstance(matches, list) or isinstance(peer_matches, list))):
+            resp_list = responses if isinstance(responses, list) else []
+            match_list = matches if isinstance(matches, list) else []
+            peer_list = peer_matches if isinstance(peer_matches, list) else []
+            active = need["state"] == "open" and need.get("audience") != "only_me"
             if need["state"] == "closed":
                 state, message = "closed", "Continued matching has stopped. Do not present earlier candidates as current."
             elif need.get("audience") == "only_me":
                 state, message = "unpublished", "This revision is not public. Review it at " + self.base + "/needs/" + need["id"] + ". Post it there to resume matching; this revision is not matching yet."
-            elif responses:
-                state, message = "responses_received", "There are current supplier responses. Read them before summarizing; an earlier research not_found is historical only."
+            elif resp_list or match_list or peer_list:
+                state = "responses_received" if resp_list else "matches_found"
+                message = "There are current matches or supplier responses. Read them before summarizing; an earlier research not_found is historical only."
             else:
-                state, message = "searching", "Continued matching is active. This read has no supplier responses yet; this is not a failed submission."
+                state, message = "searching", "Continued matching is active. This read has no matches yet; this is not a failed submission."
             current = {"state": state, "need_id": need_id,
-                       "supplier_response_count": len(responses) if need["state"] == "open" and need.get("audience") != "only_me" else 0, "message": message}
+                       "match_count": len(match_list) if active else 0,
+                       "peer_match_count": len(peer_list) if active else 0,
+                       "supplier_response_count": len(resp_list) if active else 0, "message": message}
             return {"current_matching": current, **{k: v for k, v in result.items() if k != "current_matching"}}
         return result
 
     def current_continuation(self, continued):
         """A bounded live read after conversion, with no re-submission or acknowledgement."""
         # Receipt snapshots are historical. Never keep stale candidates when a refresh fails.
-        continued = {k: v for k, v in continued.items() if k not in {"current_matching", "responses"}}
+        continued = {k: v for k, v in continued.items() if k not in {"current_matching", "responses", "matches", "peer_matches"}}
         need = continued.get("need", {})
         if continued.get("state") == "created" and isinstance(need, dict) and uuid_text(need.get("id")):
             current = {"state": "unknown", "need_id": need["id"], "message": "The Need exists, but current matches could not be verified. Do not report no matches or reuse an earlier candidate count."}
             try:
                 detail = self.need_read(need["id"])
                 if isinstance(detail, dict) and isinstance(detail.get("current_matching"), dict):
-                    return {"current_matching": detail["current_matching"], **continued, "need": detail["need"],
-                            "responses": detail["responses"]}
+                    out = {"current_matching": detail["current_matching"], **continued, "need": detail["need"]}
+                    for key in ("matches", "peer_matches", "responses"):
+                        if key in detail:
+                            out[key] = detail[key]
+                    return out
             except ClientError as error:
                 current["read_error"] = error.payload.get("code", "read_failed")
             return {**continued, "current_matching": current}
@@ -3166,16 +3368,19 @@ class Client:
             raise ClientError("invalid_input", "Provide a nonblank question about Needwing of at most 500 characters.")
         return self.tool_call(TOOL_NAMES["helper"], {"question": question}, new_call, confirm_account)
 
-    def contact(self, capability_id, text, new_conversation=False, confirm_account=None):
+    def contact(self, capability_id, text, new_conversation=False, confirm_account=None, ask=None):
         self.resolve_account_change(confirm_account)
         capability_id = self.identifier(capability_id, "capability_id")
         self.message_text(text)
+        if ask is not None and not isinstance(ask, dict):
+            raise ClientError("invalid_ask", "The --ask-json value must be a JSON object.")
         self.adopt_earlier_files()
         account = self.active_account()
         # The account is part of the identity of a contact: the same text to the same capability after a sign-in as another
         # account is another contact, never the first account's receipt. The fingerprint file is an index: before the answer it holds
         # the contact's own ids (to replay that one contact), afterwards only the conversation id; the conversation lives in its record.
-        fingerprint = hashlib.sha256(json.dumps([account, capability_id, text], ensure_ascii=False).encode("utf-8")).hexdigest()
+        fingerprint_key = [account, capability_id, text] if ask is None else [account, capability_id, text, ask]
+        fingerprint = hashlib.sha256(json.dumps(fingerprint_key, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         path = self.conversations / (fingerprint + ".json")
         saved = path.exists()
         index = read_private(path) if saved else None
@@ -3193,19 +3398,21 @@ class Client:
                 index.pop("body", None)
             write_private(path, index)
         if index is not None:
-            self.check_contact_index(index, account, capability_id, text)
-        if index is None and not new_conversation:
+            self.check_contact_index(index, account, capability_id, text, ask)
+        if index is None and not new_conversation and ask is None:
             index = self.legacy_contact(path, account, capability_id, text)
         if index is not None and new_conversation:
             if "conversation_id" not in index:
                 raise ClientError("conversation_uncertain", "Resume the original contact before starting another identical conversation.")
             index = None  # the earlier conversation keeps its own record, found by its id
         if index is None:
-            index = {"account_id": account,
-                     "body": {"client_conversation_id": "needwing-" + str(uuid.uuid4()),
-                              "capability_id": capability_id,
-                              "first_message": {"client_message_id": "needwing-" + str(uuid.uuid4()),
-                                                "parts": [{"kind": "text", "text": text}]}}}
+            body = {"client_conversation_id": "needwing-" + str(uuid.uuid4()),
+                    "capability_id": capability_id,
+                    "first_message": {"client_message_id": "needwing-" + str(uuid.uuid4()),
+                                      "parts": [{"kind": "text", "text": text}]}}
+            if ask is not None:
+                body["ask"] = ask
+            index = {"account_id": account, "body": body}
             write_private(path, index)
         if "conversation_id" not in index:
             self.write_pointer(account, {"record": path.name})
@@ -3234,7 +3441,7 @@ class Client:
         self.refresh_legacy_sends(conversation, record)
         return record["receipt"]
 
-    def check_contact_index(self, index, account, capability_id, text):
+    def check_contact_index(self, index, account, capability_id, text, ask=None):
         """An existing contact index is this account's and holds either the conversation it resolved to or the complete request still
         to be sent (replayed with its own ids). Anything else is damaged: `invalid_state`, before anything is sent or pointed at."""
         owner = self.record_owner(index)
@@ -3245,7 +3452,8 @@ class Client:
         else:
             sound = (isinstance(message, dict) and isinstance(message.get("client_message_id"), str) and
                      isinstance(body.get("client_conversation_id"), str) and body.get("capability_id") == capability_id and
-                     message.get("parts") == [{"kind": "text", "text": text}])
+                     message.get("parts") == [{"kind": "text", "text": text}] and
+                     ("ask" not in body if ask is None else body.get("ask") == ask))
         if not sound or (owner is not None and owner != account):
             raise ClientError("invalid_state", "The saved contact is invalid; nothing was sent.")
 
@@ -3345,9 +3553,11 @@ class Client:
             write_private(path, record)
         return self.record_of(path, record, conversation_id)
 
-    def send(self, text, conversation_id=None, new_message=False, confirm_account=None):
+    def send(self, text, conversation_id=None, new_message=False, confirm_account=None, after_seq=None):
         self.resolve_account_change(confirm_account)
         self.message_text(text)
+        if after_seq is not None and (not isinstance(after_seq, int) or isinstance(after_seq, bool) or after_seq < 0):
+            raise ClientError("invalid_after_seq", "Use a non-negative integer for --after-seq.")
         path, record = self.conversation_record(conversation_id)
         target = self.identifier(record["receipt"]["conversation_id"], "conversation_id")
         pending = record.get("last_send")
@@ -3357,7 +3567,8 @@ class Client:
             pending.pop("receipt", None)
             write_private(path, record)
         same_text = bool(pending) and pending["body"]["parts"] == [{"kind": "text", "text": text}]
-        if pending and "receipt" not in pending:
+        prior_pending = bool(pending and "receipt" not in pending)
+        if prior_pending:
             # A message of this client whose answer is unknown comes first: it is replayed under its own id, or nothing else is sent.
             if not same_text or new_message:
                 raise ClientError("message_uncertain", "Reconcile the previous message with its original text before sending a new one.")
@@ -3372,7 +3583,17 @@ class Client:
                     "A message like this was already sent by an earlier client version: it may have been delivered, so it is not sent again automatically.",
                     guidance=["Read the conversation to see whether it arrived.",
                               "To send this message deliberately (it may duplicate the earlier one), repeat the command with --new-message."])
-            pending = {"body": {"client_message_id": "needwing-" + str(uuid.uuid4()), "parts": [{"kind": "text", "text": text}]}}
+            if after_seq is not None:
+                seq = after_seq
+            else:
+                cursor_seq = record.get("cursor") if isinstance(record.get("cursor"), int) and not isinstance(record.get("cursor"), bool) and record["cursor"] >= 0 else 0
+                entries = record.get("entries")
+                entry_seq = max((e["seq"] for e in entries if isinstance(e, dict) and isinstance(e.get("seq"), int) and not isinstance(e.get("seq"), bool) and e["seq"] >= 0), default=0) if isinstance(entries, list) else 0
+                first_msg = record.get("receipt", {}).get("first_message") if isinstance(record.get("receipt"), dict) else None
+                first_seq = first_msg.get("seq") if isinstance(first_msg, dict) and isinstance(first_msg.get("seq"), int) and not isinstance(first_msg.get("seq"), bool) and first_msg["seq"] >= 1 else 0
+                sent_seq = record.get("last_sent_seq") if isinstance(record.get("last_sent_seq"), int) and not isinstance(record.get("last_sent_seq"), bool) and record["last_sent_seq"] >= 0 else 0
+                seq = max(cursor_seq, entry_seq, first_seq, sent_seq)
+            pending = {"body": {"client_message_id": "needwing-" + str(uuid.uuid4()), "after_seq": seq, "parts": [{"kind": "text", "text": text}]}}
             record["last_send"] = pending
             if fenced:
                 # The fence is lifted in the same write that saves the deliberate message and its id: a refusal or an interruption before
@@ -3383,10 +3604,21 @@ class Client:
                     record["legacy_send_sha256"] = remaining
             write_private(path, record)
         if "receipt" not in pending:
-            receipt = self.authorized("POST", "/v4/conversations/" + target + "/messages", pending["body"])
+            if "after_seq" not in pending["body"]:
+                pending["body"]["after_seq"] = after_seq if after_seq is not None else (
+                    record.get("cursor") if isinstance(record.get("cursor"), int) and not isinstance(record.get("cursor"), bool) and record["cursor"] >= 0 else 0
+                )
+            try:
+                receipt = self.authorized("POST", "/v4/conversations/" + target + "/messages", pending["body"])
+            except ClientError as exc:
+                if exc.payload.get("code") in ("newer_entries", "validation_failed"):
+                    record.pop("last_send", None)
+                    write_private(path, record)
+                raise
             if not message_receipt_usable(receipt):
                 raise uncertain_write("invalid_receipt", "The message answer carried no sequence and delivery state; the message stays pending under its own id.")
             pending["receipt"] = receipt
+            record["last_sent_seq"] = max(record.get("last_sent_seq", 0) if isinstance(record.get("last_sent_seq"), int) else 0, receipt["seq"])
             write_private(path, record)
         account = record.get("account_id")
         if conversation_id is not None and isinstance(account, str) and self.pointer_ambiguous(account):
@@ -3774,6 +4006,7 @@ class Client:
         if isinstance(started_for, str) and started_for.lower() != current.lower():
             self.identity.pop("trial_sign_in", None)
             self.identity.pop("login_requested", None)
+        self._clear_agent_for_account_change(current)
         self.bind_account(current)
         write_private(self.identity_path, self.identity)
         return current
@@ -4217,6 +4450,18 @@ def hint_for(payload, research_submission_refused=False, base=DEFAULT_ORIGIN):
         return ["A verified account is required. Ask the person to sign in once at " + base + " — that verifies the account — then retry."]
     if code == "not_trial":
         return ["This identity is already a Needwing account; it cannot run in-chat sign-up again. Use it, or the person signs in at " + base + "."]
+    if code == "agent_required":
+        return ["No Agent was named. Run " + cli("agents") + " to list live Agents or " + cli("agents create --name NAME") + " to create one, then pass --agent ID-OR-NAME or run " + cli("agents use ID-OR-NAME") + "."]
+    if code == "agent_not_found":
+        return ["That Agent is not on this account. Run " + cli("agents") + " to list live Agents and pass --agent ID-OR-NAME or run " + cli("agents use ID-OR-NAME") + "."]
+    if code == "agent_removed":
+        return ["This Agent was removed, and that is final. Ask the person which Agent to use and run " + cli("agents use ID-OR-NAME") + "; never create a replacement automatically."]
+    if code == "agent_not_actable":
+        return ["A trial account has one Agent and takes no --agent selector. On a person account, select a standard Agent of this account."]
+    if code == "agent_limit_reached":
+        return ["This account has its 20 live Agents. Ask the person to remove one on the website (My Agents), or use an existing Agent."]
+    if code == "agent_has_card":
+        return ["This Agent already holds a live card, and one Agent holds one card. Create or select another Agent for the new card."]
     status = payload.get("http_status")
     if status == 429 or (isinstance(code, str) and (code.endswith("quota_exceeded") or code.endswith("rate_limited"))):
         if research_submission_refused:
@@ -4240,7 +4485,8 @@ def confirm_option(subparser):
 CONFIRM_COMMANDS = frozenset({
     "run", "status", "diagnose", "followup", "discover", "need", "needs", "need-read", "need-update", "research-need", "need-cancel", "pennets", "web-search", "web-read", "helper", "contact", "send",
     "conversation", "inbox", "ack", "close", "block", "signup", "verify",
-    "provider register", "provider probe", "provider confirm", "provider publish",
+    "agents", "agents create", "agents use",
+    "provider register", "provider publish",
 })
 
 
@@ -4249,6 +4495,7 @@ def main(argv=None):
     parser.add_argument("--base-url", default=DEFAULT_ORIGIN)
     parser.add_argument("--state-dir", default=default_state_dir(), help="Persistent private state directory (existing .needwing, otherwise the user's Needwing state directory)")
     parser.add_argument("--ca-file", help="Additional deployment CA bundle; TLS verification stays enabled")
+    parser.add_argument("--agent", metavar="ID_OR_NAME", help="Agent public id (16 hex) or exact name for this call only (person accounts)")
     commands = parser.add_subparsers(dest="command", required=True)
     connect = commands.add_parser("connect", help="Check or recover the saved connection; a new trial needs NEEDWING_INVITATION_CODE")
     connect.add_argument("--client-name", help="Short client label for a new trial registration")
@@ -4331,14 +4578,16 @@ def main(argv=None):
     helper.add_argument("--question", required=True, help="The question, at most 500 characters")
     helper.add_argument("--new-call", action="store_true", help="Run it again after an answer that stayed unknown; never use to recover a timeout")
     confirm_option(helper)
-    contact = commands.add_parser("contact", help="Start or resume a consultation with a discovered supply")
-    contact.add_argument("--capability-id", required=True, help="Actual capability_id from discovery or research evidence")
+    contact = commands.add_parser("contact", help="Start or resume a consultation with a discovered supply or Ask my agent")
+    contact.add_argument("--capability-id", required=True, help="Actual capability_id from discovery, research evidence, or Ask prompt")
     contact.add_argument("--message-file", required=True)
+    contact.add_argument("--ask-json", help="JSON object for Ask my agent (passed as `ask` in POST /v4/conversations, e.g. '{\"entry\":\"profile\",\"profile_id\":\"pub_...\"}')")
     contact.add_argument("--new-conversation", action="store_true", help="Intentionally start another identical consultation; never use to recover a timeout")
     confirm_option(contact)
     send = commands.add_parser("send", help="Send or recover a message in a saved conversation")
     send.add_argument("--conversation-id")
     send.add_argument("--message-file", required=True)
+    send.add_argument("--after-seq", type=int, help="Last conversation entry sequence read before sending (default: saved cursor)")
     send.add_argument("--new-message", action="store_true", help="Intentionally send the same text again; never use to recover a timeout")
     confirm_option(send)
     conversation = commands.add_parser("conversation", help="Read or wait for a supplier reply without callback setup; includes saved history and wait_status")
@@ -4383,30 +4632,42 @@ def main(argv=None):
     block.add_argument("--conversation-id")
     block.add_argument("--side", choices=("initiator", "provider"), help="Select the side when the account has both roles")
     confirm_option(block)
-    provider = commands.add_parser("provider", help="Register, test and publish this Agent's own supply (drafts need limited; publishing needs the person's one web sign-in)")
+    agents_cmd = commands.add_parser("agents", help="List live Agents, create an Agent, or remember one for this state directory")
+    confirm_option(agents_cmd)
+    agents_commands = agents_cmd.add_subparsers(dest="agents_command")
+    agents_list_cmd = agents_commands.add_parser("list", help="List live Agents of this account")
+    confirm_option(agents_list_cmd)
+    agents_create_cmd = agents_commands.add_parser("create", help="Create a named or unnamed Agent (returns the live Agent if the name already exists)")
+    agents_create_cmd.add_argument("name", nargs="?", help="Optional Agent name (1-80 characters, not shaped like a 16-hex id)")
+    agents_create_cmd.add_argument("--name", dest="name_flag", help="Optional Agent name (same as positional name)")
+    agents_create_cmd.add_argument("--request-id", help="Optional client_request_id for idempotent unnamed Agent creation")
+    confirm_option(agents_create_cmd)
+    agents_use_cmd = agents_commands.add_parser("use", help="Remember an Agent id or name in this state directory (agent.json)")
+    agents_use_cmd.add_argument("selector", help="Agent public id (16 hex) or name")
+    confirm_option(agents_use_cmd)
+    provider = commands.add_parser("provider", help="Register and publish this Agent's own supply (drafts need limited; publishing needs the person's one web sign-in)")
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
     provider_register = provider_commands.add_parser("register", help="Register the draft provider card from a JSON file (prints the ids)")
     provider_register.add_argument("--file", required=True, help="UTF-8 JSON card file (no credentials in it; the A2A bearer is stored by a separate route)")
     confirm_option(provider_register)
-    provider_probe = provider_commands.add_parser("probe", help="Start the channel probe conversation for a draft revision (stable saved key; a retry replays)")
-    provider_probe.add_argument("--capability-id")
-    provider_probe.add_argument("--revision", type=int)
-    confirm_option(provider_probe)
-    provider_confirm = provider_commands.add_parser("confirm", help="Confirm the probe after the provider echoed its nonce from its own channel")
-    provider_confirm.add_argument("--conversation-id")
-    confirm_option(provider_confirm)
     provider_publish = provider_commands.add_parser("publish", help="Publish the exact revision (needs the person's one web sign-in for a limited account)")
     provider_publish.add_argument("--capability-id")
     provider_publish.add_argument("--revision", type=int)
     confirm_option(provider_publish)
-    provider_commands.add_parser("status", help="Show the saved provider registration, probe and publish state (local; never sends)")
+    provider_commands.add_parser("status", help="Show the saved provider registration and publish state (local; never sends)")
     args = parser.parse_args(argv)
     client = None
     try:
         with StateLock(args.state_dir):
-            client = Client(args.base_url, args.state_dir, args.ca_file)
+            client = Client(args.base_url, args.state_dir, args.ca_file, agent=args.agent)
             client.adopt_earlier_files()  # every command, under the state lock: what the earlier client left is out of its reach first
-            client.note_command("provider " + args.provider_command if args.command == "provider" else args.command)
+            if args.command == "provider":
+                cmd_label = "provider " + args.provider_command
+            elif args.command == "agents" and args.agents_command:
+                cmd_label = "agents " + args.agents_command
+            else:
+                cmd_label = args.command
+            client.note_command(cmd_label)
             client.check_version()
             if args.command == "connect":
                 result = client.connect(args.client_name, accept_terms=args.accept_terms, terms_version=args.terms_version, locale=args.locale)
@@ -4442,11 +4703,20 @@ def main(argv=None):
             elif args.command == "helper":
                 result = client.helper(args.question, args.new_call, args.confirm_account)
             elif args.command == "contact":
+                if args.ask_json is not None:
+                    try:
+                        ask = json.loads(args.ask_json)
+                    except ValueError:
+                        raise ClientError("invalid_ask", "The --ask-json value must be a JSON object.") from None
+                    if not isinstance(ask, dict):
+                        raise ClientError("invalid_ask", "The --ask-json value must be a JSON object.")
+                else:
+                    ask = None
                 result = client.contact(args.capability_id, Path(args.message_file).read_text(encoding="utf-8"),
-                                        args.new_conversation, args.confirm_account)
+                                        args.new_conversation, args.confirm_account, ask)
             elif args.command == "send":
                 result = client.send(Path(args.message_file).read_text(encoding="utf-8"), args.conversation_id,
-                                     args.new_message, args.confirm_account)
+                                     args.new_message, args.confirm_account, args.after_seq)
             elif args.command == "conversation":
                 result = client.conversation(args.conversation_id, args.wait_seconds, args.confirm_account)
             elif args.command == "need":
@@ -4483,6 +4753,17 @@ def main(argv=None):
                 result = client.close(args.conversation_id, args.confirm_account)
             elif args.command == "block":
                 result = client.block(args.conversation_id, args.confirm_account, args.side)
+            elif args.command == "agents":
+                sub = args.agents_command or "list"
+                if sub == "list":
+                    result = client.agents_list(args.confirm_account)
+                elif sub == "create":
+                    if args.name is not None and args.name_flag is not None and args.name != args.name_flag:
+                        raise ClientError("invalid_agent", "Pass the Agent name either positionally or with --name, not two different values.")
+                    name_val = args.name if args.name is not None else args.name_flag
+                    result = client.agents_create(name_val, args.request_id, args.confirm_account)
+                else:
+                    result = client.agents_use(args.selector, args.confirm_account)
             elif args.command == "provider":
                 if args.provider_command == "register":
                     try:
@@ -4490,10 +4771,6 @@ def main(argv=None):
                     except (OSError, ValueError):
                         raise ClientError("invalid_card", "The card file must be readable UTF-8 JSON.") from None
                     result = client.provider_register(card, args.confirm_account)
-                elif args.provider_command == "probe":
-                    result = client.provider_probe(args.capability_id, args.revision, args.confirm_account)
-                elif args.provider_command == "confirm":
-                    result = client.provider_confirm(args.conversation_id, args.confirm_account)
                 elif args.provider_command == "publish":
                     result = client.provider_publish(args.capability_id, args.revision, args.confirm_account)
                 else:
